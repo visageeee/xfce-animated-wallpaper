@@ -1,0 +1,14 @@
+# Build outputs
+/xfce-animated-wallpaper
+/xfce-animated-wallpaper-settings
+*.o
+
+# Editor / OS clutter
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Local scratch files
+*.log
+*.tmp

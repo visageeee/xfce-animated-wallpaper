@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Animated Wallpaper
+Comment=Configure animated desktop wallpapers
+Exec=xfce-animated-wallpaper-settings
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Categories=XFCE;Settings;DesktopSettings;
+OnlyShowIn=XFCE;
+X-XfcePluggable=true

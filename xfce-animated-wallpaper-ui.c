@@ -1,0 +1,931 @@
+#include <gtk/gtk.h>
+#include <glib/gstdio.h>
+
+typedef struct {
+    GtkWidget *window;
+    GtkWidget *file_button;
+    GtkWidget *preview_stack;
+    GtkWidget *preview_eventbox;
+    GtkWidget *preview_image;
+    GtkWidget *preview_label;
+    GtkWidget *speed_scale;
+    GtkWidget *mode_fill;
+    GtkWidget *mode_fit;
+    GtkWidget *mode_stretch;
+    GtkWidget *mute_check;
+    GtkWidget *loop_check;
+    GtkWidget *hwdec_check;
+    GtkWidget *fps_spin;
+    GtkWidget *autostart_check;
+    GtkWidget *interpolation_check;
+    GtkWidget *pause_fullscreen_check;
+    GtkWidget *pause_battery_check;
+    GtkWidget *brightness_scale;
+    GtkWidget *contrast_scale;
+    GtkWidget *saturation_scale;
+    GtkWidget *blur_scale;
+    GtkWidget *status_label;
+    GtkWidget *status_indicator;
+    GtkWidget *turn_off_button;
+    gboolean status_active;
+    gboolean enabled;
+    gboolean loading;
+} App;
+
+static gchar *config_dir(void) {
+    return g_build_filename(g_get_user_config_dir(), "xfce-animated-wallpaper", NULL);
+}
+
+static gchar *config_path(void) {
+    return g_build_filename(g_get_user_config_dir(), "xfce-animated-wallpaper", "config.ini", NULL);
+}
+
+static gchar *preview_path(void) {
+    return g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", "preview.jpg", NULL);
+}
+
+static gchar *autostart_path(void) {
+    return g_build_filename(g_get_user_config_dir(), "autostart", "xfce-animated-wallpaper.desktop", NULL);
+}
+
+static gboolean command_sync(const gchar *action, gchar **stdout_text) {
+    gchar *argv[] = {"xfce-animated-wallpaper", (gchar *)action, NULL};
+    GError *err = NULL;
+    gint status = 0;
+    gchar *stderr_text = NULL;
+    gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                               NULL, NULL, stdout_text, &stderr_text, &status, &err);
+    if (!ok) {
+        g_warning("%s", err->message);
+        g_clear_error(&err);
+        g_free(stderr_text);
+        return FALSE;
+    }
+    if (!g_spawn_check_wait_status(status, NULL) && stderr_text && *stderr_text)
+        g_warning("%s", stderr_text);
+    g_free(stderr_text);
+    return g_spawn_check_wait_status(status, NULL);
+}
+
+static gboolean draw_status_indicator(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
+    App *app = user_data;
+    GtkAllocation a;
+    gtk_widget_get_allocation(widget, &a);
+    gdouble r = MIN(a.width, a.height) * 0.34;
+    cairo_arc(cr, a.width / 2.0, a.height / 2.0, r, 0, 2 * G_PI);
+    if (app->status_active)
+        cairo_set_source_rgb(cr, 0.20, 0.72, 0.30);
+    else
+        cairo_set_source_rgb(cr, 0.82, 0.20, 0.20);
+    cairo_fill(cr);
+    return FALSE;
+}
+
+static void update_status(App *app) {
+    gchar *out = NULL;
+    app->status_active = command_sync("status", &out) && out && g_str_has_prefix(out, "running");
+    gtk_label_set_text(GTK_LABEL(app->status_label),
+                       app->status_active ? "Animated wallpaper is active" : "Using Xfce desktop background");
+    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
+    if (app->turn_off_button) gtk_widget_set_sensitive(app->turn_off_button, app->status_active);
+    g_free(out);
+}
+
+static void save_config(App *app) {
+    if (app->loading) return;
+
+    GKeyFile *kf = g_key_file_new();
+    gchar *file = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
+    const gchar *mode_key = "fill";
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_fit))) mode_key = "fit";
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_stretch))) mode_key = "stretch";
+
+    g_key_file_set_string(kf, "wallpaper", "video", file ? file : "");
+    g_key_file_set_string(kf, "wallpaper", "mode", mode_key);
+    g_key_file_set_boolean(kf, "wallpaper", "enabled", app->enabled);
+    g_key_file_set_double(kf, "playback", "speed", gtk_range_get_value(GTK_RANGE(app->speed_scale)));
+    g_key_file_set_boolean(kf, "playback", "mute", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mute_check)));
+    g_key_file_set_boolean(kf, "playback", "loop", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->loop_check)));
+    g_key_file_set_boolean(kf, "playback", "hwdec", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->hwdec_check)));
+    g_key_file_set_integer(kf, "playback", "fps_limit", gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->fps_spin)));
+    g_key_file_set_boolean(kf, "advanced", "interpolation", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->interpolation_check)));
+    g_key_file_set_boolean(kf, "advanced", "pause_fullscreen", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->pause_fullscreen_check)));
+    g_key_file_set_boolean(kf, "advanced", "pause_battery", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->pause_battery_check)));
+    g_key_file_set_double(kf, "advanced", "brightness", gtk_range_get_value(GTK_RANGE(app->brightness_scale)));
+    g_key_file_set_double(kf, "advanced", "contrast", gtk_range_get_value(GTK_RANGE(app->contrast_scale)));
+    g_key_file_set_double(kf, "advanced", "saturation", gtk_range_get_value(GTK_RANGE(app->saturation_scale)));
+    g_key_file_set_double(kf, "advanced", "blur", gtk_range_get_value(GTK_RANGE(app->blur_scale)));
+
+    gchar *dir = config_dir();
+    g_mkdir_with_parents(dir, 0700);
+    gchar *path = config_path();
+    gchar *data = g_key_file_to_data(kf, NULL, NULL);
+    g_file_set_contents(path, data, -1, NULL);
+
+    g_free(data);
+    g_free(path);
+    g_free(dir);
+    g_free(file);
+    g_key_file_unref(kf);
+}
+
+
+static void reset_defaults(App *app) {
+    app->loading = TRUE;
+
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mode_fill), TRUE);
+    gtk_range_set_value(GTK_RANGE(app->speed_scale), 1.0);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mute_check), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->loop_check), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hwdec_check), TRUE);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), 0);
+
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->interpolation_check), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->pause_fullscreen_check), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->pause_battery_check), FALSE);
+    gtk_range_set_value(GTK_RANGE(app->brightness_scale), 0.0);
+    gtk_range_set_value(GTK_RANGE(app->contrast_scale), 0.0);
+    gtk_range_set_value(GTK_RANGE(app->saturation_scale), 0.0);
+    gtk_range_set_value(GTK_RANGE(app->blur_scale), 0.0);
+
+    app->loading = FALSE;
+    save_config(app);
+}
+
+static void on_reset_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    reset_defaults((App *)data);
+}
+
+static void set_autostart(gboolean enabled) {
+    gchar *path = autostart_path();
+    gchar *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+
+    if (enabled) {
+        const gchar *desktop =
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Animated Wallpaper\n"
+            "Comment=Restore the selected animated wallpaper\n"
+            "Exec=sh -c 'sleep 5; exec xfce-animated-wallpaper autostart'\n"
+            "Terminal=false\n"
+            "OnlyShowIn=XFCE;\n"
+            "X-GNOME-Autostart-enabled=true\n";
+        g_file_set_contents(path, desktop, -1, NULL);
+    } else {
+        g_unlink(path);
+    }
+
+    g_free(dir);
+    g_free(path);
+}
+
+static void show_preview_message(App *app, const gchar *message) {
+    gtk_label_set_text(GTK_LABEL(app->preview_label), message);
+    gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
+}
+
+static void update_preview(App *app) {
+    gchar *video = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
+    if (!video || !*video) {
+        show_preview_message(app, "Click the preview to choose an animated wallpaper");
+        g_free(video);
+        return;
+    }
+
+    gchar *ffmpeg = g_find_program_in_path("ffmpeg");
+    if (!ffmpeg) {
+        show_preview_message(app, "Install ffmpeg to generate preview thumbnails");
+        g_free(video);
+        return;
+    }
+
+    gchar *out = preview_path();
+    gchar *out_dir = g_path_get_dirname(out);
+    g_mkdir_with_parents(out_dir, 0700);
+
+    gchar *argv[] = {
+        ffmpeg,
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", "2",
+        "-i", video,
+        "-frames:v", "1",
+        "-vf", "scale=240:135:force_original_aspect_ratio=decrease",
+        out,
+        NULL
+    };
+
+    GError *err = NULL;
+    gint status = 0;
+    gchar *stderr_text = NULL;
+    gboolean spawned = g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL,
+                                    NULL, &stderr_text, &status, &err);
+
+    /* Very short clips may not have a frame at 2 seconds. Retry at the start. */
+    if (!spawned || !g_spawn_check_wait_status(status, NULL)) {
+        if (err) g_clear_error(&err);
+        g_clear_pointer(&stderr_text, g_free);
+        argv[5] = "0";
+        spawned = g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL,
+                               NULL, &stderr_text, &status, &err);
+    }
+
+    if (spawned && g_spawn_check_wait_status(status, NULL)) {
+        GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale(out, 240, 135, TRUE, &err);
+        if (pixbuf) {
+            gtk_image_set_from_pixbuf(GTK_IMAGE(app->preview_image), pixbuf);
+            gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "image");
+            g_object_unref(pixbuf);
+        } else {
+            show_preview_message(app, "Could not load the generated preview");
+        }
+    } else {
+        show_preview_message(app, "Could not generate a preview for this wallpaper");
+    }
+
+    if (err) g_clear_error(&err);
+    g_free(stderr_text);
+    g_free(out_dir);
+    g_free(out);
+    g_free(ffmpeg);
+    g_free(video);
+}
+
+
+typedef struct {
+    App *app;
+    GtkWidget *dialog;
+    gchar *filename;
+} GalleryChoice;
+
+static gboolean supported_wallpaper_file(const gchar *name) {
+    if (!name) return FALSE;
+    gchar *lower = g_ascii_strdown(name, -1);
+    const gchar *exts[] = {
+        ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpg", ".mpeg",
+        ".gif", ".apng", NULL
+    };
+    gboolean ok = FALSE;
+    for (int i = 0; exts[i]; i++) {
+        if (g_str_has_suffix(lower, exts[i])) { ok = TRUE; break; }
+    }
+    g_free(lower);
+    return ok;
+}
+
+static gchar *gallery_thumbnail_for(const gchar *filename) {
+    gchar *ffmpeg = g_find_program_in_path("ffmpeg");
+    if (!ffmpeg) return NULL;
+
+    gchar *sum = g_compute_checksum_for_string(G_CHECKSUM_SHA256, filename, -1);
+    gchar *dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", "gallery", NULL);
+    g_mkdir_with_parents(dir, 0700);
+    gchar *base = g_strdup_printf("%s.jpg", sum);
+    gchar *thumb = g_build_filename(dir, base, NULL);
+
+    if (!g_file_test(thumb, G_FILE_TEST_IS_REGULAR)) {
+        gchar *argv[] = {
+            ffmpeg,
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", "1",
+            "-i", (gchar *)filename,
+            "-frames:v", "1",
+            "-vf", "scale=180:100:force_original_aspect_ratio=decrease,pad=180:100:(ow-iw)/2:(oh-ih)/2",
+            thumb,
+            NULL
+        };
+        gint status = 0;
+        GError *err = NULL;
+        gboolean ok = g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL, NULL, NULL, &status, &err);
+        if (!ok || !g_spawn_check_wait_status(status, NULL)) {
+            if (err) g_clear_error(&err);
+            argv[5] = "0";
+            ok = g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL, NULL, NULL, &status, &err);
+        }
+        if (!ok || !g_spawn_check_wait_status(status, NULL)) {
+            g_unlink(thumb);
+        }
+        if (err) g_clear_error(&err);
+    }
+
+    g_free(ffmpeg);
+    g_free(sum);
+    g_free(dir);
+    g_free(base);
+    if (!g_file_test(thumb, G_FILE_TEST_IS_REGULAR)) {
+        g_free(thumb);
+        return NULL;
+    }
+    return thumb;
+}
+
+static void gallery_choice_free(gpointer data, GClosure *closure) {
+    (void)closure;
+    GalleryChoice *choice = data;
+    g_free(choice->filename);
+    g_free(choice);
+}
+
+static void on_gallery_item_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    GalleryChoice *choice = data;
+    gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(choice->app->file_button), choice->filename);
+    update_preview(choice->app);
+    save_config(choice->app);
+    gtk_widget_destroy(choice->dialog);
+}
+
+static GtkWidget *gallery_tile(App *app, GtkWidget *dialog, const gchar *filename) {
+    GtkWidget *button = gtk_button_new();
+    gtk_widget_set_size_request(button, 200, 145);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 5);
+    gtk_container_add(GTK_CONTAINER(button), box);
+
+    gchar *thumb = gallery_thumbnail_for(filename);
+    GtkWidget *image = NULL;
+    if (thumb) {
+        GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale(thumb, 180, 100, TRUE, NULL);
+        image = pixbuf ? gtk_image_new_from_pixbuf(pixbuf) : gtk_image_new_from_icon_name("video-x-generic", GTK_ICON_SIZE_DIALOG);
+        if (pixbuf) g_object_unref(pixbuf);
+    } else {
+        image = gtk_image_new_from_icon_name("video-x-generic", GTK_ICON_SIZE_DIALOG);
+    }
+    gtk_box_pack_start(GTK_BOX(box), image, TRUE, TRUE, 0);
+
+    gchar *base = g_path_get_basename(filename);
+    GtkWidget *label = gtk_label_new(base);
+    gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 24);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+    gtk_widget_set_tooltip_text(button, filename);
+
+    GalleryChoice *choice = g_new0(GalleryChoice, 1);
+    choice->app = app;
+    choice->dialog = dialog;
+    choice->filename = g_strdup(filename);
+    g_signal_connect_data(button, "clicked", G_CALLBACK(on_gallery_item_clicked), choice,
+                          gallery_choice_free, 0);
+
+    g_free(thumb);
+    g_free(base);
+    return button;
+}
+
+static gint compare_string_ptrs(gconstpointer a, gconstpointer b) {
+    const gchar *sa = *(const gchar * const *)a;
+    const gchar *sb = *(const gchar * const *)b;
+    return g_utf8_collate(sa, sb);
+}
+
+static void populate_gallery(App *app, GtkWidget *dialog, GtkWidget *flow, const gchar *folder) {
+    GList *children = gtk_container_get_children(GTK_CONTAINER(flow));
+    for (GList *l = children; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(children);
+
+    GDir *dir = g_dir_open(folder, 0, NULL);
+    if (!dir) return;
+
+    GPtrArray *files = g_ptr_array_new_with_free_func(g_free);
+    const gchar *name;
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        if (!supported_wallpaper_file(name)) continue;
+        gchar *path = g_build_filename(folder, name, NULL);
+        if (g_file_test(path, G_FILE_TEST_IS_REGULAR))
+            g_ptr_array_add(files, path);
+        else
+            g_free(path);
+    }
+    g_dir_close(dir);
+    g_ptr_array_sort(files, compare_string_ptrs);
+
+    guint limit = MIN(files->len, 100);
+    for (guint i = 0; i < limit; i++) {
+        GtkWidget *tile = gallery_tile(app, dialog, g_ptr_array_index(files, i));
+        gtk_container_add(GTK_CONTAINER(flow), tile);
+    }
+
+    if (files->len == 0) {
+        GtkWidget *label = gtk_label_new("No supported animated wallpapers found in this folder.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(label), "dim-label");
+        gtk_container_add(GTK_CONTAINER(flow), label);
+    }
+    g_ptr_array_free(files, TRUE);
+    gtk_widget_show_all(flow);
+}
+
+typedef struct {
+    App *app;
+    GtkWidget *dialog;
+    GtkWidget *flow;
+    GtkWidget *folder_label;
+    gchar *folder;
+} GalleryWindow;
+
+static void gallery_window_free(gpointer data, GClosure *closure) {
+    (void)closure;
+    GalleryWindow *gw = data;
+    g_free(gw->folder);
+    g_free(gw);
+}
+
+static void on_gallery_change_folder(GtkButton *button, gpointer data) {
+    (void)button;
+    GalleryWindow *gw = data;
+    GtkWidget *chooser = gtk_file_chooser_dialog_new(
+        "Choose wallpaper folder", GTK_WINDOW(gw->dialog), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+        "Cancel", GTK_RESPONSE_CANCEL, "Open", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(chooser), gw->folder);
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
+        gchar *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+        if (folder) {
+            g_free(gw->folder);
+            gw->folder = folder;
+            gtk_label_set_text(GTK_LABEL(gw->folder_label), gw->folder);
+            populate_gallery(gw->app, gw->dialog, gw->flow, gw->folder);
+        }
+    }
+    gtk_widget_destroy(chooser);
+}
+
+static void show_gallery(App *app) {
+    gchar *current = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
+    gchar *folder = NULL;
+    if (current && *current)
+        folder = g_path_get_dirname(current);
+    else
+        folder = g_build_filename(g_get_home_dir(), "Pictures", NULL);
+    g_free(current);
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Wallpaper Gallery", GTK_WINDOW(app->window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "Close", GTK_RESPONSE_CLOSE, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 760, 560);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(content), top, FALSE, FALSE, 0);
+
+    GtkWidget *folder_label = gtk_label_new(folder);
+    gtk_label_set_xalign(GTK_LABEL(folder_label), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(folder_label), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_box_pack_start(GTK_BOX(top), folder_label, TRUE, TRUE, 0);
+    GtkWidget *change = gtk_button_new_with_label("Change Folder…");
+    gtk_box_pack_end(GTK_BOX(top), change, FALSE, FALSE, 0);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 10);
+    GtkWidget *flow = gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(flow), GTK_SELECTION_NONE);
+    gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(flow), 3);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(flow), 8);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(flow), 8);
+    gtk_container_set_border_width(GTK_CONTAINER(flow), 4);
+    gtk_container_add(GTK_CONTAINER(scroll), flow);
+
+    GalleryWindow *gw = g_new0(GalleryWindow, 1);
+    gw->app = app;
+    gw->dialog = dialog;
+    gw->flow = flow;
+    gw->folder_label = folder_label;
+    gw->folder = g_strdup(folder);
+    g_signal_connect_data(change, "clicked", G_CALLBACK(on_gallery_change_folder), gw,
+                          gallery_window_free, 0);
+
+    populate_gallery(app, dialog, flow, folder);
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    g_free(folder);
+}
+
+static void on_gallery_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    show_gallery((App *)data);
+}
+
+static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    (void)widget;
+    if (event->button != 1) return FALSE;
+    App *app = data;
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Choose animated wallpaper", GTK_WINDOW(app->window), GTK_FILE_CHOOSER_ACTION_OPEN,
+        "Cancel", GTK_RESPONSE_CANCEL, "Open", GTK_RESPONSE_ACCEPT, NULL);
+
+    GtkFileFilter *filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, "Animated wallpaper files");
+    gtk_file_filter_add_mime_type(filter, "video/*");
+    gtk_file_filter_add_mime_type(filter, "image/gif");
+    gtk_file_filter_add_mime_type(filter, "image/apng");
+    gtk_file_filter_add_pattern(filter, "*.gif");
+    gtk_file_filter_add_pattern(filter, "*.GIF");
+    gtk_file_filter_add_pattern(filter, "*.apng");
+    gtk_file_filter_add_pattern(filter, "*.APNG");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+
+    gchar *current = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
+    if (current) gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(dialog), current);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        gchar *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (filename) {
+            gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(app->file_button), filename);
+            update_preview(app);
+            save_config(app);
+            g_free(filename);
+        }
+    }
+    g_free(current);
+    gtk_widget_destroy(dialog);
+    return TRUE;
+}
+
+static void on_setting_changed(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    App *app = data;
+    if (app->loading) return;
+    save_config(app);
+}
+
+static void on_file_set(GtkFileChooserButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+    if (app->loading) return;
+    update_preview(app);
+    save_config(app);
+}
+
+static void on_autostart_toggled(GtkToggleButton *button, gpointer data) {
+    (void)data;
+    set_autostart(gtk_toggle_button_get_active(button));
+}
+
+static void on_set_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+    gchar *video = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
+    if (!video || !*video || !g_file_test(video, G_FILE_TEST_IS_REGULAR)) {
+        gtk_label_set_text(GTK_LABEL(app->status_label), "Choose a valid animated wallpaper first");
+        g_free(video);
+        return;
+    }
+    g_free(video);
+
+    app->enabled = TRUE;
+    save_config(app);
+    if (!command_sync("restart", NULL)) {
+        gtk_label_set_text(GTK_LABEL(app->status_label), "Could not start animated wallpaper");
+        return;
+    }
+    update_status(app);
+}
+
+static void on_turn_off_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+    app->enabled = FALSE;
+    save_config(app);
+    command_sync("stop", NULL);
+    update_status(app);
+}
+
+static void load_config(App *app) {
+    app->loading = TRUE;
+
+    gchar *path = config_path();
+    GKeyFile *kf = g_key_file_new();
+    GError *err = NULL;
+    gboolean loaded = g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, &err);
+    if (err) g_clear_error(&err);
+
+    gchar *video = loaded ? g_key_file_get_string(kf, "wallpaper", "video", NULL) : NULL;
+    gchar *mode = loaded ? g_key_file_get_string(kf, "wallpaper", "mode", NULL) : NULL;
+    app->enabled = loaded && g_key_file_get_boolean(kf, "wallpaper", "enabled", NULL);
+    gdouble speed = loaded ? g_key_file_get_double(kf, "playback", "speed", NULL) : 1.0;
+    gboolean mute = loaded ? g_key_file_get_boolean(kf, "playback", "mute", NULL) : TRUE;
+    gboolean loop = loaded ? g_key_file_get_boolean(kf, "playback", "loop", NULL) : TRUE;
+    gboolean hwdec = loaded ? g_key_file_get_boolean(kf, "playback", "hwdec", NULL) : TRUE;
+    gint fps = loaded ? g_key_file_get_integer(kf, "playback", "fps_limit", NULL) : 0;
+    gboolean interpolation = loaded ? g_key_file_get_boolean(kf, "advanced", "interpolation", NULL) : FALSE;
+    gboolean pause_fullscreen = loaded && g_key_file_has_key(kf, "advanced", "pause_fullscreen", NULL) ? g_key_file_get_boolean(kf, "advanced", "pause_fullscreen", NULL) : TRUE;
+    gboolean pause_battery = loaded && g_key_file_has_key(kf, "advanced", "pause_battery", NULL) ? g_key_file_get_boolean(kf, "advanced", "pause_battery", NULL) : FALSE;
+    gdouble brightness = loaded ? g_key_file_get_double(kf, "advanced", "brightness", NULL) : 0.0;
+    gdouble contrast = loaded ? g_key_file_get_double(kf, "advanced", "contrast", NULL) : 0.0;
+    gdouble saturation = loaded ? g_key_file_get_double(kf, "advanced", "saturation", NULL) : 0.0;
+    gdouble blur = loaded ? g_key_file_get_double(kf, "advanced", "blur", NULL) : 0.0;
+
+    if (video && *video)
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(app->file_button), video);
+
+    gtk_range_set_value(GTK_RANGE(app->speed_scale), speed > 0 ? speed : 1.0);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mute_check), mute);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->loop_check), loop);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hwdec_check), hwdec);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), fps);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->interpolation_check), interpolation);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->pause_fullscreen_check), pause_fullscreen);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->pause_battery_check), pause_battery);
+    gtk_range_set_value(GTK_RANGE(app->brightness_scale), brightness);
+    gtk_range_set_value(GTK_RANGE(app->contrast_scale), contrast);
+    gtk_range_set_value(GTK_RANGE(app->saturation_scale), saturation);
+    gtk_range_set_value(GTK_RANGE(app->blur_scale), blur);
+
+    if (g_strcmp0(mode, "fit") == 0)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mode_fit), TRUE);
+    else if (g_strcmp0(mode, "stretch") == 0)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mode_stretch), TRUE);
+    else
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mode_fill), TRUE);
+
+    gchar *apath = autostart_path();
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->autostart_check),
+                                 g_file_test(apath, G_FILE_TEST_EXISTS));
+    g_free(apath);
+
+    g_free(video);
+    g_key_file_unref(kf);
+    g_free(path);
+
+    app->loading = FALSE;
+    update_preview(app);
+    update_status(app);
+}
+
+static GtkWidget *row(const gchar *title, const gchar *subtitle, GtkWidget *control) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
+    GtkWidget *text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget *t = gtk_label_new(NULL);
+    gchar *markup = g_markup_printf_escaped("<b>%s</b>", title);
+    gtk_label_set_markup(GTK_LABEL(t), markup);
+    g_free(markup);
+    gtk_label_set_xalign(GTK_LABEL(t), 0.0);
+    gtk_box_pack_start(GTK_BOX(text), t, FALSE, FALSE, 0);
+
+    if (subtitle) {
+        GtkWidget *s = gtk_label_new(subtitle);
+        gtk_label_set_xalign(GTK_LABEL(s), 0.0);
+        gtk_label_set_line_wrap(GTK_LABEL(s), TRUE);
+        gtk_style_context_add_class(gtk_widget_get_style_context(s), "dim-label");
+        gtk_box_pack_start(GTK_BOX(text), s, FALSE, FALSE, 0);
+    }
+
+    gtk_box_pack_start(GTK_BOX(box), text, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(box), control, FALSE, FALSE, 0);
+    gtk_widget_set_margin_top(box, 10);
+    gtk_widget_set_margin_bottom(box, 10);
+    return box;
+}
+
+static GtkWidget *centered_check_group(void) {
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    GtkWidget *inner = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_halign(outer, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(outer, 10);
+    gtk_widget_set_margin_bottom(outer, 10);
+    gtk_box_pack_start(GTK_BOX(outer), inner, FALSE, FALSE, 0);
+    g_object_set_data(G_OBJECT(outer), "check-group-inner", inner);
+    return outer;
+}
+
+static void centered_check_group_add(GtkWidget *group, GtkWidget *check) {
+    GtkWidget *inner = g_object_get_data(G_OBJECT(group), "check-group-inner");
+    gtk_widget_set_halign(check, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(check, 5);
+    gtk_widget_set_margin_bottom(check, 5);
+    gtk_box_pack_start(GTK_BOX(inner), check, FALSE, FALSE, 0);
+}
+
+static void speed_fill_changed(GtkRange *range, gpointer user_data) {
+    (void) user_data;
+    gtk_range_set_fill_level(range, gtk_range_get_value(range));
+}
+
+int main(int argc, char **argv) {
+    gtk_init(&argc, &argv);
+
+    App app = {0};
+
+    app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(app.window), "Animated Wallpaper");
+    gtk_window_set_default_size(GTK_WINDOW(app.window), 680, 850);
+    gtk_container_set_border_width(GTK_CONTAINER(app.window), 18);
+    g_signal_connect(app.window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_add(GTK_CONTAINER(app.window), root);
+
+    GtkWidget *notebook = gtk_notebook_new();
+    gtk_box_pack_start(GTK_BOX(root), notebook, TRUE, TRUE, 0);
+
+    GtkWidget *general_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(general_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    GtkWidget *general = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(general), 10);
+    gtk_container_add(GTK_CONTAINER(general_scroll), general);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), general_scroll, gtk_label_new("Animated Wallpaper"));
+
+    app.preview_stack = gtk_stack_new();
+    gtk_widget_set_size_request(app.preview_stack, 240, 135);
+    gtk_widget_set_hexpand(app.preview_stack, FALSE);
+    gtk_widget_set_vexpand(app.preview_stack, FALSE);
+    gtk_widget_set_halign(app.preview_stack, GTK_ALIGN_CENTER);
+    app.preview_image = gtk_image_new();
+    gtk_stack_add_named(GTK_STACK(app.preview_stack), app.preview_image, "image");
+    app.preview_label = gtk_label_new("Choose a wallpaper to preview it");
+    gtk_widget_set_hexpand(app.preview_label, TRUE);
+    gtk_widget_set_vexpand(app.preview_label, TRUE);
+    gtk_label_set_justify(GTK_LABEL(app.preview_label), GTK_JUSTIFY_CENTER);
+    gtk_style_context_add_class(gtk_widget_get_style_context(app.preview_label), "dim-label");
+    gtk_stack_add_named(GTK_STACK(app.preview_stack), app.preview_label, "message");
+
+    GtkWidget *preview_frame = gtk_frame_new("Preview");
+    gtk_frame_set_label_align(GTK_FRAME(preview_frame), 0.5f, 0.5f);
+    app.preview_eventbox = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(app.preview_eventbox), FALSE);
+    gtk_event_box_set_above_child(GTK_EVENT_BOX(app.preview_eventbox), TRUE);
+    gtk_widget_set_tooltip_text(app.preview_eventbox, "Click to choose a different animated wallpaper");
+    gtk_container_add(GTK_CONTAINER(app.preview_eventbox), app.preview_stack);
+    gtk_container_add(GTK_CONTAINER(preview_frame), app.preview_eventbox);
+    gtk_widget_set_halign(preview_frame, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(preview_frame, GTK_ALIGN_START);
+    gtk_widget_set_hexpand(preview_frame, FALSE);
+    gtk_widget_set_vexpand(preview_frame, FALSE);
+    gtk_widget_set_margin_top(preview_frame, 10);
+    gtk_widget_set_margin_bottom(preview_frame, 10);
+    gtk_box_pack_start(GTK_BOX(general), preview_frame, FALSE, FALSE, 0);
+
+    app.file_button = gtk_file_chooser_button_new("Choose animated wallpaper", GTK_FILE_CHOOSER_ACTION_OPEN);
+    GtkFileFilter *filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, "Animated wallpaper files");
+    gtk_file_filter_add_mime_type(filter, "video/*");
+    gtk_file_filter_add_mime_type(filter, "image/gif");
+    gtk_file_filter_add_mime_type(filter, "image/apng");
+    gtk_file_filter_add_pattern(filter, "*.gif");
+    gtk_file_filter_add_pattern(filter, "*.GIF");
+    gtk_file_filter_add_pattern(filter, "*.apng");
+    gtk_file_filter_add_pattern(filter, "*.APNG");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(app.file_button), filter);
+    GtkWidget *picker_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_size_request(app.file_button, -1, 30);
+    gtk_box_pack_start(GTK_BOX(picker_box), app.file_button, TRUE, TRUE, 0);
+    GtkWidget *gallery_button = gtk_button_new_with_label("Gallery…");
+    gtk_widget_set_tooltip_text(gallery_button, "Browse a folder as a grid of animated wallpaper thumbnails");
+    gtk_widget_set_size_request(gallery_button, -1, 30);
+    gtk_box_pack_start(GTK_BOX(picker_box), gallery_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(general), row("Wallpaper", "Choose a video, GIF, APNG, or another animated format supported by mpv.", picker_box), FALSE, FALSE, 0);
+
+    GtkWidget *mode_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_set_homogeneous(GTK_BOX(mode_box), TRUE);
+    gtk_widget_set_size_request(mode_box, 270, -1);
+    gtk_style_context_add_class(gtk_widget_get_style_context(mode_box), "linked");
+    app.mode_fill = gtk_radio_button_new_with_label(NULL, "Fill");
+    GSList *mode_group = gtk_radio_button_get_group(GTK_RADIO_BUTTON(app.mode_fill));
+    app.mode_fit = gtk_radio_button_new_with_label(mode_group, "Fit");
+    mode_group = gtk_radio_button_get_group(GTK_RADIO_BUTTON(app.mode_fit));
+    app.mode_stretch = gtk_radio_button_new_with_label(mode_group, "Stretch");
+    gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(app.mode_fill), FALSE);
+    gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(app.mode_fit), FALSE);
+    gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(app.mode_stretch), FALSE);
+    gtk_widget_set_size_request(app.mode_fill, -1, 30);
+    gtk_widget_set_size_request(app.mode_fit, -1, 30);
+    gtk_widget_set_size_request(app.mode_stretch, -1, 30);
+    gtk_box_pack_start(GTK_BOX(mode_box), app.mode_fill, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(mode_box), app.mode_fit, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(mode_box), app.mode_stretch, TRUE, TRUE, 0);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.mode_fill), TRUE);
+    gtk_box_pack_start(GTK_BOX(general), row("Scaling", "Fill crops edges; Fit preserves the whole image; Stretch ignores aspect ratio.", mode_box), FALSE, FALSE, 0);
+
+    app.speed_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.2, 2.0, 0.1);
+    gtk_widget_set_size_request(app.speed_scale, 210, -1);
+    gtk_scale_set_digits(GTK_SCALE(app.speed_scale), 1);
+    gtk_range_set_round_digits(GTK_RANGE(app.speed_scale), 1);
+    gtk_range_set_show_fill_level(GTK_RANGE(app.speed_scale), TRUE);
+    gtk_range_set_restrict_to_fill_level(GTK_RANGE(app.speed_scale), FALSE);
+    gtk_range_set_fill_level(GTK_RANGE(app.speed_scale), 1.0);
+    g_signal_connect(app.speed_scale, "value-changed", G_CALLBACK(speed_fill_changed), NULL);
+    for (gdouble mark = 0.2; mark <= 2.0001; mark += 0.1)
+        gtk_scale_add_mark(GTK_SCALE(app.speed_scale), mark, GTK_POS_BOTTOM, NULL);
+    gtk_scale_set_value_pos(GTK_SCALE(app.speed_scale), GTK_POS_RIGHT);
+    gtk_box_pack_start(GTK_BOX(general), row("Playback speed", "Useful for slowing down subtle ambient loops.", app.speed_scale), FALSE, FALSE, 0);
+
+    GtkWidget *general_checks = centered_check_group();
+    app.mute_check = gtk_check_button_new_with_label("Mute audio");
+    centered_check_group_add(general_checks, app.mute_check);
+    app.loop_check = gtk_check_button_new_with_label("Loop wallpaper video");
+    centered_check_group_add(general_checks, app.loop_check);
+    app.autostart_check = gtk_check_button_new_with_label("Start when you log in");
+    centered_check_group_add(general_checks, app.autostart_check);
+    gtk_box_pack_start(GTK_BOX(general), general_checks, FALSE, FALSE, 0);
+
+    GtkWidget *advanced_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(advanced_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    GtkWidget *advanced = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(advanced), 10);
+    gtk_container_add(GTK_CONTAINER(advanced_scroll), advanced);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), advanced_scroll, gtk_label_new("Advanced settings"));
+
+    GtkWidget *advanced_checks = centered_check_group();
+    app.interpolation_check = gtk_check_button_new_with_label("Smooth motion with frame interpolation");
+    gtk_widget_set_tooltip_text(app.interpolation_check, "Uses mpv display-resample synchronization and temporal interpolation. This can increase GPU usage.");
+    centered_check_group_add(advanced_checks, app.interpolation_check);
+
+    app.hwdec_check = gtk_check_button_new_with_label("Use hardware video decoding when available");
+    gtk_widget_set_tooltip_text(app.hwdec_check, "Lets mpv use hardware video decoding when possible. Blur may require software decoding.");
+    centered_check_group_add(advanced_checks, app.hwdec_check);
+
+    app.pause_fullscreen_check = gtk_check_button_new_with_label("Pause when another application is fullscreen");
+    gtk_widget_set_tooltip_text(app.pause_fullscreen_check, "Pauses wallpaper rendering while the active X11 window is fullscreen.");
+    centered_check_group_add(advanced_checks, app.pause_fullscreen_check);
+
+    app.pause_battery_check = gtk_check_button_new_with_label("Pause while running on battery");
+    gtk_widget_set_tooltip_text(app.pause_battery_check, "Pauses wallpaper rendering when a system battery reports Discharging.");
+    centered_check_group_add(advanced_checks, app.pause_battery_check);
+    gtk_box_pack_start(GTK_BOX(advanced), advanced_checks, FALSE, FALSE, 0);
+
+    app.fps_spin = gtk_spin_button_new_with_range(0, 240, 1);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(app.fps_spin), TRUE);
+    gtk_box_pack_start(GTK_BOX(advanced), row("FPS limit", "0 uses the wallpaper's normal frame rate.", app.fps_spin), FALSE, FALSE, 0);
+
+    app.brightness_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, -100, 100, 1);
+    gtk_widget_set_size_request(app.brightness_scale, 260, -1);
+    gtk_scale_set_value_pos(GTK_SCALE(app.brightness_scale), GTK_POS_RIGHT);
+    gtk_box_pack_start(GTK_BOX(advanced), row("Brightness", "Darken the wallpaper to make desktop icons and windows stand out.", app.brightness_scale), FALSE, FALSE, 0);
+
+    app.contrast_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, -100, 100, 1);
+    gtk_widget_set_size_request(app.contrast_scale, 260, -1);
+    gtk_scale_set_value_pos(GTK_SCALE(app.contrast_scale), GTK_POS_RIGHT);
+    gtk_box_pack_start(GTK_BOX(advanced), row("Contrast", "Adjust the difference between dark and bright areas.", app.contrast_scale), FALSE, FALSE, 0);
+
+    app.saturation_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, -100, 100, 1);
+    gtk_widget_set_size_request(app.saturation_scale, 260, -1);
+    gtk_scale_set_value_pos(GTK_SCALE(app.saturation_scale), GTK_POS_RIGHT);
+    gtk_box_pack_start(GTK_BOX(advanced), row("Saturation", "Reduce color intensity for a calmer wallpaper, or increase it for stronger colors.", app.saturation_scale), FALSE, FALSE, 0);
+
+    app.blur_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 20, 0.5);
+    gtk_widget_set_size_request(app.blur_scale, 260, -1);
+    gtk_scale_set_digits(GTK_SCALE(app.blur_scale), 1);
+    gtk_scale_set_value_pos(GTK_SCALE(app.blur_scale), GTK_POS_RIGHT);
+    gtk_box_pack_start(GTK_BOX(advanced), row("Blur", "Apply Gaussian blur. Higher values cost more GPU time.", app.blur_scale), FALSE, FALSE, 0);
+
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(root), sep, FALSE, FALSE, 2);
+
+    GtkWidget *bottom = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    app.status_indicator = gtk_drawing_area_new();
+    gtk_widget_set_size_request(app.status_indicator, 14, 14);
+    g_signal_connect(app.status_indicator, "draw", G_CALLBACK(draw_status_indicator), &app);
+    gtk_box_pack_start(GTK_BOX(status_box), app.status_indicator, FALSE, FALSE, 0);
+    app.status_label = gtk_label_new("Using Xfce desktop background");
+    gtk_label_set_xalign(GTK_LABEL(app.status_label), 0.0);
+    gtk_box_pack_start(GTK_BOX(status_box), app.status_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(bottom), status_box, TRUE, TRUE, 0);
+
+    GtkWidget *reset_defaults_button = gtk_button_new_with_label("Reset to Defaults");
+    gtk_widget_set_tooltip_text(reset_defaults_button, "Restore playback and advanced settings to their defaults. The selected wallpaper and autostart choice are kept. Changes are not applied until Set Wallpaper is pressed.");
+    gtk_box_pack_end(GTK_BOX(bottom), reset_defaults_button, FALSE, FALSE, 0);
+
+    app.turn_off_button = gtk_button_new_with_label("Turn Off");
+    gtk_widget_set_tooltip_text(app.turn_off_button, "Stop the animated wallpaper and reveal the wallpaper configured in XFCE.");
+    gtk_widget_set_sensitive(app.turn_off_button, FALSE);
+    gtk_box_pack_end(GTK_BOX(bottom), app.turn_off_button, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(root), bottom, FALSE, FALSE, 0);
+
+    GtkWidget *set_wallpaper = gtk_button_new_with_label("Set Wallpaper");
+    gtk_style_context_add_class(gtk_widget_get_style_context(set_wallpaper), "suggested-action");
+    gtk_widget_set_hexpand(set_wallpaper, TRUE);
+    gtk_widget_set_size_request(set_wallpaper, -1, 44);
+    gtk_box_pack_start(GTK_BOX(root), set_wallpaper, FALSE, FALSE, 0);
+
+    g_signal_connect(app.preview_eventbox, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
+    g_signal_connect(gallery_button, "clicked", G_CALLBACK(on_gallery_clicked), &app);
+    g_signal_connect(app.file_button, "file-set", G_CALLBACK(on_file_set), &app);
+    g_signal_connect(app.mode_fill, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.mode_fit, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.mode_stretch, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.speed_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.mute_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.loop_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.hwdec_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.fps_spin, "value-changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.autostart_check, "toggled", G_CALLBACK(on_autostart_toggled), &app);
+    g_signal_connect(app.interpolation_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.pause_fullscreen_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.pause_battery_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.brightness_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.contrast_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.saturation_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.blur_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(reset_defaults_button, "clicked", G_CALLBACK(on_reset_clicked), &app);
+    g_signal_connect(set_wallpaper, "clicked", G_CALLBACK(on_set_clicked), &app);
+    g_signal_connect(app.turn_off_button, "clicked", G_CALLBACK(on_turn_off_clicked), &app);
+
+    load_config(&app);
+    gtk_widget_show_all(app.window);
+    gtk_main();
+    return 0;
+}
