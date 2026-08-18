@@ -7,6 +7,10 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 > **Version:** 0.1.0  
 > **Status:** early release. X11 only.
 
+## Demo
+
+![Animated Wallpaper settings UI](awdemo.webp)
+
 ## Features
 
 - Native GTK3 settings app integrated with Xfce Settings Manager

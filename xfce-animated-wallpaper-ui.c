@@ -34,6 +34,7 @@ typedef struct {
     gboolean status_active;
     gboolean enabled;
     gboolean loading;
+    gchar *applied_video;
     GPid preview_pid;
     guint preview_restart_source;
     gboolean preview_restart_pending;
@@ -104,6 +105,8 @@ static void save_config(App *app) {
     if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_stretch))) mode_key = "stretch";
 
     g_key_file_set_string(kf, "wallpaper", "video", file ? file : "");
+    g_key_file_set_string(kf, "wallpaper", "applied_video",
+                          app->applied_video ? app->applied_video : "");
     g_key_file_set_string(kf, "wallpaper", "mode", mode_key);
     g_key_file_set_boolean(kf, "wallpaper", "enabled", app->enabled);
     g_key_file_set_double(kf, "playback", "speed", gtk_range_get_value(GTK_RANGE(app->speed_scale)));
@@ -337,6 +340,7 @@ static void update_preview(App *app) {
     g_ptr_array_add(argv, g_strdup("--no-audio"));
     g_ptr_array_add(argv, g_strdup("--no-osc"));
     g_ptr_array_add(argv, g_strdup("--no-input-default-bindings"));
+    g_ptr_array_add(argv, g_strdup("--input-cursor-passthrough=yes"));
     g_ptr_array_add(argv, g_strdup("--msg-level=all=info"));
     g_ptr_array_add(argv, g_strdup("--force-window=yes"));
     g_ptr_array_add(argv, speed_arg);
@@ -453,8 +457,10 @@ static gboolean on_window_focus_out(GtkWidget *widget, GdkEventFocus *event, gpo
 }
 
 static void on_window_destroy(GtkWidget *widget, gpointer data) {
+    App *app = data;
     (void)widget;
     stop_preview((App *)data);
+    g_clear_pointer(&app->applied_video, g_free);
     gtk_main_quit();
 }
 
@@ -537,8 +543,8 @@ static void on_gallery_item_clicked(GtkButton *button, gpointer data) {
     (void)button;
     GalleryChoice *choice = data;
     gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(choice->app->file_button), choice->filename);
-    update_preview(choice->app);
     save_config(choice->app);
+    schedule_preview_restart(choice->app);
     gtk_widget_destroy(choice->dialog);
 }
 
@@ -679,7 +685,7 @@ static void show_gallery(App *app) {
     gtk_label_set_xalign(GTK_LABEL(folder_label), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(folder_label), PANGO_ELLIPSIZE_MIDDLE);
     gtk_box_pack_start(GTK_BOX(top), folder_label, TRUE, TRUE, 0);
-    GtkWidget *change = gtk_button_new_with_label("Change Folder…");
+    GtkWidget *change = gtk_button_new_with_label("Change Folderâ€¦");
     gtk_box_pack_end(GTK_BOX(top), change, FALSE, FALSE, 0);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -739,8 +745,15 @@ static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpo
         gchar *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(app->file_button), filename);
-            /* GtkFileChooserButton emits file-set; that callback saves the
-             * config and restarts the preview once. */
+
+            /*
+             * Programmatically changing GtkFileChooserButton here does not
+             * reliably emit "file-set", so explicitly use the same safe
+             * preview restart path as the normal chooser/gallery.
+             */
+            schedule_preview_restart(app);
+            save_config(app);
+
             g_free(filename);
         }
     }
@@ -779,6 +792,8 @@ static void on_set_clicked(GtkButton *button, gpointer data) {
         g_free(video);
         return;
     }
+    g_free(app->applied_video);
+    app->applied_video = g_strdup(video);
     g_free(video);
 
     app->enabled = TRUE;
@@ -809,6 +824,18 @@ static void load_config(App *app) {
     if (err) g_clear_error(&err);
 
     gchar *video = loaded ? g_key_file_get_string(kf, "wallpaper", "video", NULL) : NULL;
+    app->applied_video = loaded && g_key_file_has_key(kf, "wallpaper", "applied_video", NULL)
+                           ? g_key_file_get_string(kf, "wallpaper", "applied_video", NULL)
+                           : NULL;
+
+    /* On launch, show the wallpaper actually applied with Set Wallpaper,
+     * not the last file merely browsed in the preview UI. */
+    if (app->applied_video && *app->applied_video &&
+        g_file_test(app->applied_video, G_FILE_TEST_IS_REGULAR)) {
+        g_free(video);
+        video = g_strdup(app->applied_video);
+    }
+
     gchar *mode = loaded ? g_key_file_get_string(kf, "wallpaper", "mode", NULL) : NULL;
     app->enabled = loaded && g_key_file_get_boolean(kf, "wallpaper", "enabled", NULL);
     gdouble speed = loaded ? g_key_file_get_double(kf, "playback", "speed", NULL) : 1.0;
@@ -957,10 +984,11 @@ int main(int argc, char **argv) {
 
     GtkWidget *preview_frame = gtk_frame_new("Preview");
     gtk_frame_set_label_align(GTK_FRAME(preview_frame), 0.5f, 0.5f);
+
     app.preview_eventbox = gtk_event_box_new();
     gtk_event_box_set_visible_window(GTK_EVENT_BOX(app.preview_eventbox), FALSE);
-    gtk_event_box_set_above_child(GTK_EVENT_BOX(app.preview_eventbox), TRUE);
-    gtk_widget_set_tooltip_text(app.preview_eventbox, "Click to choose a different animated wallpaper");
+    gtk_widget_set_tooltip_text(app.preview_eventbox,
+                                "Click to choose a different animated wallpaper");
     gtk_container_add(GTK_CONTAINER(app.preview_eventbox), app.preview_stack);
     gtk_container_add(GTK_CONTAINER(preview_frame), app.preview_eventbox);
     gtk_widget_set_halign(preview_frame, GTK_ALIGN_CENTER);
@@ -988,7 +1016,7 @@ int main(int argc, char **argv) {
     GtkWidget *picker_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_size_request(app.file_button, -1, 30);
     gtk_box_pack_start(GTK_BOX(picker_box), app.file_button, TRUE, TRUE, 0);
-    GtkWidget *gallery_button = gtk_button_new_with_label("Gallery…");
+    GtkWidget *gallery_button = gtk_button_new_with_label("Gallery...");
     gtk_widget_set_tooltip_text(gallery_button, "Browse a folder as a grid of animated wallpaper thumbnails");
     gtk_widget_set_size_request(gallery_button, -1, 30);
     gtk_box_pack_start(GTK_BOX(picker_box), gallery_button, FALSE, FALSE, 0);
@@ -1121,6 +1149,8 @@ int main(int argc, char **argv) {
     g_signal_connect(app.preview_area, "realize", G_CALLBACK(on_preview_realize), &app);
     g_signal_connect(app.preview_area, "plug-removed", G_CALLBACK(on_preview_plug_removed), &app);
     g_signal_connect(app.preview_eventbox, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
+    gtk_widget_add_events(app.preview_area, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(app.preview_area, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
     g_signal_connect(gallery_button, "clicked", G_CALLBACK(on_gallery_clicked), &app);
     g_signal_connect(app.file_button, "file-set", G_CALLBACK(on_file_set), &app);
     g_signal_connect(app.mode_fill, "toggled", G_CALLBACK(on_setting_changed), &app);
