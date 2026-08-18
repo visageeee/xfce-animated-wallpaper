@@ -1,3 +1,17 @@
+## 0.2.0
+
+- Add user-facing stream error reporting for HTTP 403, yt-dlp failures, unreachable streams, and unexpected playback exits.
+
+- Let mpv/FFmpeg handle normal stream chunk continuity; only respawn yt-dlp webpage streams when mpv actually exits.
+
+- Restart yt-dlp/webpage streams from their original URL if mpv exits and reconnect is enabled.
+
+- Add local file / stream URL source modes.
+- Add live preview support for network streams.
+- Support YouTube and other yt-dlp-compatible webpage URLs through mpv's ytdl hook.
+- Add optional automatic reconnect for HTTP/HLS streams.
+- Keep previewed and applied sources separate.
+
 # Changelog
 
 ## 0.1.1

@@ -8,6 +8,12 @@
 typedef struct {
     GtkWidget *window;
     GtkWidget *file_button;
+    GtkWidget *wallpaper_row;
+    GtkWidget *stream_row;
+    GtkWidget *source_local;
+    GtkWidget *source_stream;
+    GtkWidget *stream_entry;
+    GtkWidget *reconnect_check;
     GtkWidget *preview_stack;
     GtkWidget *preview_eventbox;
     GtkWidget *preview_area;
@@ -32,9 +38,12 @@ typedef struct {
     GtkWidget *status_indicator;
     GtkWidget *turn_off_button;
     gboolean status_active;
+    guint status_poll_source;
     gboolean enabled;
     gboolean loading;
     gchar *applied_video;
+    gchar *applied_stream;
+    gchar *applied_source;
     GPid preview_pid;
     guint preview_restart_source;
     gboolean preview_restart_pending;
@@ -85,14 +94,70 @@ static gboolean draw_status_indicator(GtkWidget *widget, cairo_t *cr, gpointer u
     return FALSE;
 }
 
+
+static gchar *wallpaper_log_path(void) {
+    return g_build_filename(g_get_user_cache_dir(),
+                            "xfce-animated-wallpaper",
+                            "wallpaper-mpv.log", NULL);
+}
+
+static gchar *friendly_stream_error_from_text(const gchar *text) {
+    if (!text || !*text)
+        return NULL;
+
+    if (strstr(text, "HTTP error 403") || strstr(text, "HTTP Error 403") ||
+        strstr(text, "403 Forbidden"))
+        return g_strdup("YouTube or the stream provider refused the video stream (HTTP 403).");
+
+    if (strstr(text, "yt-dlp") &&
+        (strstr(text, "ERROR:") || strstr(text, "error")))
+        return g_strdup("yt-dlp could not resolve or open this web video.");
+
+    if (strstr(text, "Failed to open") || strstr(text, "Errors when loading file") ||
+        strstr(text, "No video or audio streams selected"))
+        return g_strdup("The stream could not be opened.");
+
+    if (strstr(text, "Connection refused") || strstr(text, "timed out") ||
+        strstr(text, "Network is unreachable"))
+        return g_strdup("The stream could not be reached.");
+
+    return NULL;
+}
+
+static gchar *read_wallpaper_error(void) {
+    gchar *path = wallpaper_log_path();
+    gchar *text = NULL;
+    g_file_get_contents(path, &text, NULL, NULL);
+    g_free(path);
+
+    gchar *friendly = friendly_stream_error_from_text(text);
+    g_free(text);
+    return friendly;
+}
+
 static void update_status(App *app) {
     gchar *out = NULL;
     app->status_active = command_sync("status", &out) && out && g_str_has_prefix(out, "running");
-    gtk_label_set_text(GTK_LABEL(app->status_label),
-                       app->status_active ? "Animated wallpaper is active" : "Using Xfce desktop background");
+
+    if (app->status_active) {
+        gtk_label_set_text(GTK_LABEL(app->status_label), "Animated wallpaper is active");
+    } else if (app->enabled) {
+        gchar *friendly = read_wallpaper_error();
+        gtk_label_set_text(GTK_LABEL(app->status_label),
+                           friendly ? friendly : "Animated wallpaper stopped unexpectedly");
+        g_free(friendly);
+    } else {
+        gtk_label_set_text(GTK_LABEL(app->status_label), "Using Xfce desktop background");
+    }
+
     if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
     if (app->turn_off_button) gtk_widget_set_sensitive(app->turn_off_button, app->status_active);
     g_free(out);
+}
+
+static gboolean status_poll_cb(gpointer data) {
+    update_status((App *)data);
+    return G_SOURCE_CONTINUE;
 }
 
 static void save_config(App *app) {
@@ -100,13 +165,26 @@ static void save_config(App *app) {
 
     GKeyFile *kf = g_key_file_new();
     gchar *file = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
+    const gchar *stream_url = gtk_entry_get_text(GTK_ENTRY(app->stream_entry));
+    const gchar *source_key =
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->source_stream))
+            ? "stream" : "local";
     const gchar *mode_key = "fill";
     if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_fit))) mode_key = "fit";
     if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_stretch))) mode_key = "stretch";
 
+    g_key_file_set_string(kf, "wallpaper", "source", source_key);
     g_key_file_set_string(kf, "wallpaper", "video", file ? file : "");
+    g_key_file_set_string(kf, "wallpaper", "stream_url", stream_url ? stream_url : "");
+    g_key_file_set_boolean(kf, "wallpaper", "reconnect",
+                           gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->reconnect_check)));
+
+    g_key_file_set_string(kf, "wallpaper", "applied_source",
+                          app->applied_source ? app->applied_source : "");
     g_key_file_set_string(kf, "wallpaper", "applied_video",
                           app->applied_video ? app->applied_video : "");
+    g_key_file_set_string(kf, "wallpaper", "applied_stream",
+                          app->applied_stream ? app->applied_stream : "");
     g_key_file_set_string(kf, "wallpaper", "mode", mode_key);
     g_key_file_set_boolean(kf, "wallpaper", "enabled", app->enabled);
     g_key_file_set_double(kf, "playback", "speed", gtk_range_get_value(GTK_RANGE(app->speed_scale)));
@@ -208,8 +286,23 @@ static void preview_child_exited(GPid pid, gint status, gpointer data) {
         app->preview_pid = 0;
     g_spawn_close_pid(pid);
 
-    if (app->preview_restart_pending && app->preview_restart_source == 0)
+    if (app->preview_restart_pending && app->preview_restart_source == 0) {
         app->preview_restart_source = g_timeout_add(120, restart_preview_cb, app);
+    } else if (!app->preview_restart_pending) {
+        gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+        gchar *log_path = g_build_filename(cache_dir, "preview-mpv.log", NULL);
+        gchar *log_text = NULL;
+        g_file_get_contents(log_path, &log_text, NULL, NULL);
+        gchar *friendly = friendly_stream_error_from_text(log_text);
+        if (friendly) {
+            gtk_label_set_text(GTK_LABEL(app->preview_label), friendly);
+            gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
+        }
+        g_free(friendly);
+        g_free(log_text);
+        g_free(log_path);
+        g_free(cache_dir);
+    }
 }
 
 static void stop_preview(App *app) {
@@ -229,6 +322,61 @@ static void show_preview_message(App *app, const gchar *message) {
     gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
 }
 
+
+static gboolean source_is_stream(App *app) {
+    return gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->source_stream));
+}
+
+static gchar *selected_source(App *app) {
+    if (source_is_stream(app)) {
+        const gchar *url = gtk_entry_get_text(GTK_ENTRY(app->stream_entry));
+        return g_strdup(url ? url : "");
+    }
+    return gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
+}
+
+static gboolean source_is_valid(App *app, const gchar *source) {
+    if (!source || !*source)
+        return FALSE;
+    if (source_is_stream(app))
+        return strstr(source, "://") != NULL;
+    return g_file_test(source, G_FILE_TEST_IS_REGULAR);
+}
+
+
+static gboolean url_is_direct_stream(const gchar *url) {
+    if (!url || !*url) return FALSE;
+    gchar *lower = g_ascii_strdown(url, -1);
+    gboolean direct =
+        g_str_has_prefix(lower, "rtsp://") ||
+        g_str_has_prefix(lower, "rtmp://") ||
+        g_str_has_prefix(lower, "udp://") ||
+        g_str_has_prefix(lower, "tcp://") ||
+        strstr(lower, ".m3u8") != NULL ||
+        strstr(lower, ".mpd") != NULL ||
+        g_str_has_suffix(lower, ".mp4") ||
+        g_str_has_suffix(lower, ".webm") ||
+        g_str_has_suffix(lower, ".mkv") ||
+        g_str_has_suffix(lower, ".mov") ||
+        g_str_has_suffix(lower, ".ts");
+    g_free(lower);
+    return direct;
+}
+
+static void update_source_controls(App *app) {
+    gboolean stream = source_is_stream(app);
+
+    if (app->wallpaper_row)
+        gtk_widget_set_visible(app->wallpaper_row, !stream);
+    if (app->stream_row)
+        gtk_widget_set_visible(app->stream_row, stream);
+
+    gtk_widget_set_sensitive(app->file_button, !stream);
+    gtk_widget_set_sensitive(app->stream_entry, stream);
+    gtk_widget_set_sensitive(app->reconnect_check, stream);
+    gtk_widget_set_sensitive(app->loop_check, !stream);
+}
+
 static void update_preview(App *app) {
     gchar *cache_dir_debug = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
     g_mkdir_with_parents(cache_dir_debug, 0700);
@@ -241,9 +389,12 @@ static void update_preview(App *app) {
     g_free(debug_path);
     g_free(cache_dir_debug);
 
-    gchar *video = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
-    if (!video || !*video || !g_file_test(video, G_FILE_TEST_IS_REGULAR)) {
-        show_preview_message(app, "Click the preview to choose an animated wallpaper");
+    gchar *video = selected_source(app);
+    if (!source_is_valid(app, video)) {
+        show_preview_message(app,
+            source_is_stream(app)
+                ? "Enter a stream URL to preview it"
+                : "Click the preview to choose an animated wallpaper");
         g_free(video);
         return;
     }
@@ -336,7 +487,22 @@ static void update_preview(App *app) {
     g_ptr_array_add(argv, g_strdup("sh"));
     g_ptr_array_add(argv, g_strdup(log_path));
     g_ptr_array_add(argv, xid_arg);
-    g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+    if (!source_is_stream(app) &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->loop_check)))
+        g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+
+    if (source_is_stream(app)) {
+        if (url_is_direct_stream(video)) {
+            /* Let mpv/FFmpeg handle direct stream continuity itself. */
+            if (!g_str_has_prefix(video, "rtsp://"))
+                g_ptr_array_add(argv, g_strdup("--network-timeout=15"));
+        } else {
+            /* Webpage URLs such as YouTube use mpv's yt-dlp hook. */
+            g_ptr_array_add(argv, g_strdup("--ytdl=yes"));
+            g_ptr_array_add(argv, g_strdup("--script-opts=ytdl_hook-try_ytdl_first=yes"));
+        }
+    }
+
     g_ptr_array_add(argv, g_strdup("--no-audio"));
     g_ptr_array_add(argv, g_strdup("--no-osc"));
     g_ptr_array_add(argv, g_strdup("--no-input-default-bindings"));
@@ -461,6 +627,8 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     (void)widget;
     stop_preview((App *)data);
     g_clear_pointer(&app->applied_video, g_free);
+    g_clear_pointer(&app->applied_stream, g_free);
+    g_clear_pointer(&app->applied_source, g_free);
     gtk_main_quit();
 }
 
@@ -685,7 +853,7 @@ static void show_gallery(App *app) {
     gtk_label_set_xalign(GTK_LABEL(folder_label), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(folder_label), PANGO_ELLIPSIZE_MIDDLE);
     gtk_box_pack_start(GTK_BOX(top), folder_label, TRUE, TRUE, 0);
-    GtkWidget *change = gtk_button_new_with_label("Change Folderâ€¦");
+    GtkWidget *change = gtk_button_new_with_label("Change Folder…");
     gtk_box_pack_end(GTK_BOX(top), change, FALSE, FALSE, 0);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -724,6 +892,13 @@ static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpo
     (void)widget;
     if (event->button != 1) return FALSE;
     App *app = data;
+
+    if (source_is_stream(app)) {
+        gtk_widget_grab_focus(app->stream_entry);
+        gtk_editable_select_region(GTK_EDITABLE(app->stream_entry), 0, -1);
+        return TRUE;
+    }
+
     GtkWidget *dialog = gtk_file_chooser_dialog_new(
         "Choose animated wallpaper", GTK_WINDOW(app->window), GTK_FILE_CHOOSER_ACTION_OPEN,
         "Cancel", GTK_RESPONSE_CANCEL, "Open", GTK_RESPONSE_ACCEPT, NULL);
@@ -762,6 +937,16 @@ static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpo
     return TRUE;
 }
 
+
+static void on_source_toggled(GtkToggleButton *button, gpointer data) {
+    App *app = data;
+    if (!gtk_toggle_button_get_active(button) || app->loading)
+        return;
+    update_source_controls(app);
+    save_config(app);
+    schedule_preview_restart(app);
+}
+
 static void on_setting_changed(GtkWidget *widget, gpointer data) {
     (void)widget;
     App *app = data;
@@ -786,14 +971,29 @@ static void on_autostart_toggled(GtkToggleButton *button, gpointer data) {
 static void on_set_clicked(GtkButton *button, gpointer data) {
     (void)button;
     App *app = data;
-    gchar *video = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
-    if (!video || !*video || !g_file_test(video, G_FILE_TEST_IS_REGULAR)) {
-        gtk_label_set_text(GTK_LABEL(app->status_label), "Choose a valid animated wallpaper first");
+    gchar *video = selected_source(app);
+    if (!source_is_valid(app, video)) {
+        gtk_label_set_text(GTK_LABEL(app->status_label),
+                           source_is_stream(app)
+                               ? "Enter a valid stream URL first"
+                               : "Choose a valid animated wallpaper first");
         g_free(video);
         return;
     }
+
+    g_free(app->applied_source);
     g_free(app->applied_video);
-    app->applied_video = g_strdup(video);
+    g_free(app->applied_stream);
+
+    if (source_is_stream(app)) {
+        app->applied_source = g_strdup("stream");
+        app->applied_stream = g_strdup(video);
+        app->applied_video = NULL;
+    } else {
+        app->applied_source = g_strdup("local");
+        app->applied_video = g_strdup(video);
+        app->applied_stream = NULL;
+    }
     g_free(video);
 
     app->enabled = TRUE;
@@ -824,6 +1024,23 @@ static void load_config(App *app) {
     if (err) g_clear_error(&err);
 
     gchar *video = loaded ? g_key_file_get_string(kf, "wallpaper", "video", NULL) : NULL;
+    gchar *stream_url = loaded && g_key_file_has_key(kf, "wallpaper", "stream_url", NULL)
+                          ? g_key_file_get_string(kf, "wallpaper", "stream_url", NULL) : NULL;
+    gchar *source = loaded && g_key_file_has_key(kf, "wallpaper", "source", NULL)
+                      ? g_key_file_get_string(kf, "wallpaper", "source", NULL) : g_strdup("local");
+    gboolean reconnect = loaded && g_key_file_has_key(kf, "wallpaper", "reconnect", NULL)
+                           ? g_key_file_get_boolean(kf, "wallpaper", "reconnect", NULL) : TRUE;
+
+    app->applied_source = loaded && g_key_file_has_key(kf, "wallpaper", "applied_source", NULL)
+                            ? g_key_file_get_string(kf, "wallpaper", "applied_source", NULL)
+                            : NULL;
+    app->applied_video = loaded && g_key_file_has_key(kf, "wallpaper", "applied_video", NULL)
+                           ? g_key_file_get_string(kf, "wallpaper", "applied_video", NULL)
+                           : NULL;
+    app->applied_stream = loaded && g_key_file_has_key(kf, "wallpaper", "applied_stream", NULL)
+                            ? g_key_file_get_string(kf, "wallpaper", "applied_stream", NULL)
+                            : NULL;
+
     app->applied_video = loaded && g_key_file_has_key(kf, "wallpaper", "applied_video", NULL)
                            ? g_key_file_get_string(kf, "wallpaper", "applied_video", NULL)
                            : NULL;
@@ -832,6 +1049,21 @@ static void load_config(App *app) {
      * not the last file merely browsed in the preview UI. */
     if (app->applied_video && *app->applied_video &&
         g_file_test(app->applied_video, G_FILE_TEST_IS_REGULAR)) {
+        g_free(video);
+        video = g_strdup(app->applied_video);
+    }
+
+    /* On launch, show the source actually applied with Set Wallpaper. */
+    if (app->applied_source && g_strcmp0(app->applied_source, "stream") == 0 &&
+        app->applied_stream && *app->applied_stream) {
+        g_free(source);
+        source = g_strdup("stream");
+        g_free(stream_url);
+        stream_url = g_strdup(app->applied_stream);
+    } else if (app->applied_video && *app->applied_video &&
+               g_file_test(app->applied_video, G_FILE_TEST_IS_REGULAR)) {
+        g_free(source);
+        source = g_strdup("local");
         g_free(video);
         video = g_strdup(app->applied_video);
     }
@@ -853,6 +1085,13 @@ static void load_config(App *app) {
 
     if (video && *video)
         gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(app->file_button), video);
+    if (stream_url && *stream_url)
+        gtk_entry_set_text(GTK_ENTRY(app->stream_entry), stream_url);
+
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(
+        g_strcmp0(source, "stream") == 0 ? app->source_stream : app->source_local), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->reconnect_check), reconnect);
+    update_source_controls(app);
 
     gtk_range_set_value(GTK_RANGE(app->speed_scale), speed > 0 ? speed : 1.0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mute_check), mute);
@@ -880,6 +1119,8 @@ static void load_config(App *app) {
     g_free(apath);
 
     g_free(video);
+    g_free(stream_url);
+    g_free(source);
     g_key_file_unref(kf);
     g_free(path);
 
@@ -978,7 +1219,13 @@ int main(int argc, char **argv) {
     app.preview_label = gtk_label_new("Choose a wallpaper to preview it");
     gtk_widget_set_hexpand(app.preview_label, TRUE);
     gtk_widget_set_vexpand(app.preview_label, TRUE);
+    gtk_widget_set_size_request(app.preview_label, 220, -1);
+    gtk_label_set_line_wrap(GTK_LABEL(app.preview_label), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(app.preview_label), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(app.preview_label), 30);
     gtk_label_set_justify(GTK_LABEL(app.preview_label), GTK_JUSTIFY_CENTER);
+    gtk_label_set_xalign(GTK_LABEL(app.preview_label), 0.5f);
+    gtk_label_set_yalign(GTK_LABEL(app.preview_label), 0.5f);
     gtk_style_context_add_class(gtk_widget_get_style_context(app.preview_label), "dim-label");
     gtk_stack_add_named(GTK_STACK(app.preview_stack), app.preview_label, "message");
 
@@ -995,12 +1242,30 @@ int main(int argc, char **argv) {
     gtk_widget_set_valign(preview_frame, GTK_ALIGN_START);
     gtk_widget_set_hexpand(preview_frame, FALSE);
     gtk_widget_set_vexpand(preview_frame, FALSE);
+    gtk_widget_set_size_request(preview_frame, 250, -1);
     gtk_widget_set_margin_top(preview_frame, 10);
     gtk_widget_set_margin_bottom(preview_frame, 10);
     /* Keep the live preview outside the notebook so it remains visible on every tab. */
     gtk_widget_set_valign(preview_frame, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(content), preview_frame, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
+
+    GtkWidget *source_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(source_box), "linked");
+    app.source_local = gtk_radio_button_new_with_label(NULL, "Local file");
+    GSList *source_group = gtk_radio_button_get_group(GTK_RADIO_BUTTON(app.source_local));
+    app.source_stream = gtk_radio_button_new_with_label(source_group, "Stream");
+    gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(app.source_local), FALSE);
+    gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(app.source_stream), FALSE);
+    gtk_widget_set_size_request(app.source_local, 120, 30);
+    gtk_widget_set_size_request(app.source_stream, 120, 30);
+    gtk_box_pack_start(GTK_BOX(source_box), app.source_local, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(source_box), app.source_stream, TRUE, TRUE, 0);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.source_local), TRUE);
+    gtk_box_pack_start(GTK_BOX(general),
+                       row("Source", "Choose a local animated file or a network/web video source.",
+                           source_box),
+                       FALSE, FALSE, 0);
 
     app.file_button = gtk_file_chooser_button_new("Choose animated wallpaper", GTK_FILE_CHOOSER_ACTION_OPEN);
     GtkFileFilter *filter = gtk_file_filter_new();
@@ -1020,7 +1285,22 @@ int main(int argc, char **argv) {
     gtk_widget_set_tooltip_text(gallery_button, "Browse a folder as a grid of animated wallpaper thumbnails");
     gtk_widget_set_size_request(gallery_button, -1, 30);
     gtk_box_pack_start(GTK_BOX(picker_box), gallery_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(general), row("Wallpaper", "Choose a video, GIF, APNG, or another animated format supported by mpv.", picker_box), FALSE, FALSE, 0);
+    app.wallpaper_row = row("Wallpaper",
+                            "Choose a video, GIF, APNG, or another animated format supported by mpv.",
+                            picker_box);
+    gtk_box_pack_start(GTK_BOX(general), app.wallpaper_row, FALSE, FALSE, 0);
+
+    app.stream_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(app.stream_entry),
+                                   "https://example.com/live/stream.m3u8");
+    gtk_widget_set_size_request(app.stream_entry, 360, 30);
+    app.stream_row = row(
+        "Stream URL",
+        "Direct streams such as HLS (.m3u8), DASH, RTSP, or media URLs are recommended. "
+        "Web video URLs such as YouTube are supported through yt-dlp but are experimental and may freeze or reconnect.",
+        app.stream_entry);
+    gtk_box_pack_start(GTK_BOX(general), app.stream_row, FALSE, FALSE, 0);
+
 
     GtkWidget *mode_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_box_set_homogeneous(GTK_BOX(mode_box), TRUE);
@@ -1061,6 +1341,9 @@ int main(int argc, char **argv) {
     centered_check_group_add(general_checks, app.mute_check);
     app.loop_check = gtk_check_button_new_with_label("Loop wallpaper video");
     centered_check_group_add(general_checks, app.loop_check);
+    app.reconnect_check = gtk_check_button_new_with_label("Reconnect web video if playback stops");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.reconnect_check), TRUE);
+    centered_check_group_add(general_checks, app.reconnect_check);
     app.autostart_check = gtk_check_button_new_with_label("Start when you log in");
     centered_check_group_add(general_checks, app.autostart_check);
     gtk_box_pack_start(GTK_BOX(general), general_checks, FALSE, FALSE, 0);
@@ -1151,6 +1434,10 @@ int main(int argc, char **argv) {
     g_signal_connect(app.preview_eventbox, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
     gtk_widget_add_events(app.preview_area, GDK_BUTTON_PRESS_MASK);
     g_signal_connect(app.preview_area, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
+    g_signal_connect(app.source_local, "toggled", G_CALLBACK(on_source_toggled), &app);
+    g_signal_connect(app.source_stream, "toggled", G_CALLBACK(on_source_toggled), &app);
+    g_signal_connect(app.stream_entry, "changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.reconnect_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(gallery_button, "clicked", G_CALLBACK(on_gallery_clicked), &app);
     g_signal_connect(app.file_button, "file-set", G_CALLBACK(on_file_set), &app);
     g_signal_connect(app.mode_fill, "toggled", G_CALLBACK(on_setting_changed), &app);
@@ -1175,6 +1462,8 @@ int main(int argc, char **argv) {
 
     load_config(&app);
     gtk_widget_show_all(app.window);
+    app.status_poll_source = g_timeout_add_seconds(2, status_poll_cb, &app);
+    update_source_controls(&app);
 
     /*
      * load_config() runs before widgets are realized.  Starting the preview

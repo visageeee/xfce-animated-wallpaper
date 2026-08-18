@@ -6,6 +6,6 @@ Comment=Configure animated desktop wallpapers
 Exec=xfce-animated-wallpaper-settings
 Icon=preferences-desktop-wallpaper
 Terminal=false
-Categories=XFCE;Settings;DesktopSettings;
+Categories=XFCE;GTK;Settings;DesktopSettings;X-XFCE-SettingsDialog;
 OnlyShowIn=XFCE;
 X-XfcePluggable=true

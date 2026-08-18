@@ -16,6 +16,15 @@ static gchar *pid_path(void) {
                             "xfce-animated-wallpaper.pid", NULL);
 }
 
+static gchar *wallpaper_log_path(void) {
+    gchar *dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+    g_mkdir_with_parents(dir, 0700);
+    gchar *path = g_build_filename(dir, "wallpaper-mpv.log", NULL);
+    g_free(dir);
+    return path;
+}
+
+
 static gboolean process_alive(GPid pid) {
     return pid > 1 && kill(-pid, 0) == 0;
 }
@@ -147,6 +156,26 @@ static gboolean wait_for_safe_desktop(void) {
     return FALSE;
 }
 
+
+static gboolean url_is_direct_stream(const gchar *url) {
+    if (!url || !*url) return FALSE;
+    gchar *lower = g_ascii_strdown(url, -1);
+    gboolean direct =
+        g_str_has_prefix(lower, "rtsp://") ||
+        g_str_has_prefix(lower, "rtmp://") ||
+        g_str_has_prefix(lower, "udp://") ||
+        g_str_has_prefix(lower, "tcp://") ||
+        strstr(lower, ".m3u8") != NULL ||
+        strstr(lower, ".mpd") != NULL ||
+        g_str_has_suffix(lower, ".mp4") ||
+        g_str_has_suffix(lower, ".webm") ||
+        g_str_has_suffix(lower, ".mkv") ||
+        g_str_has_suffix(lower, ".mov") ||
+        g_str_has_suffix(lower, ".ts");
+    g_free(lower);
+    return direct;
+}
+
 static gboolean start_wallpaper(gboolean require_enabled) {
     gchar *cfg = config_path();
     GKeyFile *kf = g_key_file_new();
@@ -167,7 +196,25 @@ static gboolean start_wallpaper(gboolean require_enabled) {
         return TRUE;
     }
 
-    gchar *video = get_string(kf, "wallpaper", "video", "");
+    gchar *source = get_string(kf, "wallpaper", "applied_source", "");
+    gchar *video = get_string(kf, "wallpaper", "applied_video", "");
+    gchar *stream_url = get_string(kf, "wallpaper", "applied_stream", "");
+
+    /* Backward compatibility with configs written before applied_* existed. */
+    if (!source || !*source) {
+        g_free(source);
+        source = get_string(kf, "wallpaper", "source", "local");
+    }
+    if ((!video || !*video) && g_strcmp0(source, "local") == 0) {
+        g_free(video);
+        video = get_string(kf, "wallpaper", "video", "");
+    }
+    if ((!stream_url || !*stream_url) && g_strcmp0(source, "stream") == 0) {
+        g_free(stream_url);
+        stream_url = get_string(kf, "wallpaper", "stream_url", "");
+    }
+
+    gboolean reconnect = get_bool(kf, "wallpaper", "reconnect", TRUE);
     gchar *mode = get_string(kf, "wallpaper", "mode", "fill");
     gboolean mute = get_bool(kf, "playback", "mute", TRUE);
     gboolean loop = get_bool(kf, "playback", "loop", TRUE);
@@ -182,9 +229,18 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     gdouble saturation = get_double(kf, "advanced", "saturation", 0.0);
     gdouble blur = get_double(kf, "advanced", "blur", 0.0);
 
-    if (!video || !*video || !g_file_test(video, G_FILE_TEST_IS_REGULAR)) {
-        g_printerr("No valid wallpaper video configured.\n");
-        g_free(video); g_free(mode); g_key_file_unref(kf); g_free(cfg);
+    gboolean is_stream = g_strcmp0(source, "stream") == 0;
+    const gchar *media = is_stream ? stream_url : video;
+    gboolean restart_web_stream =
+        is_stream && !url_is_direct_stream(media) && reconnect;
+
+    if (!media || !*media ||
+        (!is_stream && !g_file_test(media, G_FILE_TEST_IS_REGULAR))) {
+        g_printerr(is_stream
+                       ? "No valid wallpaper stream configured.\n"
+                       : "No valid wallpaper video configured.\n");
+        g_free(source); g_free(video); g_free(stream_url); g_free(mode);
+        g_key_file_unref(kf); g_free(cfg);
         return FALSE;
     }
 
@@ -202,11 +258,15 @@ static gboolean start_wallpaper(gboolean require_enabled) {
      *   xwinwrap -ov -fs -ni -b -nf -- \
      *     sh -c 'wid=$1; shift; exec mpv --wid="$wid" "$@"' sh WID ...
      */
+    gchar *wall_log = wallpaper_log_path();
+
     const gchar *xw_args[] = {
         "xwinwrap", "-ov", "-fs", "-ni", "-b", "-nf", "--",
         "sh", "-c",
-        "wid=$1; pf=$2; pb=$3; shift 3; "
-        "mpv --wid=\"$wid\" \"$@\" & p=$!; paused=0; "
+        "wid=$1; pf=$2; pb=$3; wr=$4; log=$5; shift 5; "
+        ": >\"$log\"; "
+        "while :; do "
+        "mpv --wid=\"$wid\" \"$@\" >>\"$log\" 2>&1 & p=$!; paused=0; "
         "while kill -0 $p 2>/dev/null; do want=0; "
         "if [ \"$pf\" = 1 ]; then "
         "aw=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $5}'); "
@@ -214,9 +274,15 @@ static gboolean start_wallpaper(gboolean require_enabled) {
         "if [ \"$pb\" = 1 ]; then for st in /sys/class/power_supply/*/status; do "
         "[ -r \"$st\" ] && grep -qx Discharging \"$st\" && want=1; done; fi; "
         "if [ $want -eq 1 ] && [ $paused -eq 0 ]; then kill -STOP $p 2>/dev/null; paused=1; "
-        "elif [ $want -eq 0 ] && [ $paused -eq 1 ]; then kill -CONT $p 2>/dev/null; paused=0; fi; sleep 2; done; wait $p",
+        "elif [ $want -eq 0 ] && [ $paused -eq 1 ]; then kill -CONT $p 2>/dev/null; paused=0; fi; sleep 2; done; "
+        "wait $p; rc=$?; "
+        "if [ \"$wr\" != 1 ]; then exit $rc; fi; "
+        "sleep 2; "
+        "done",
         "sh", "WID",
         pause_fullscreen ? "1" : "0", pause_battery ? "1" : "0",
+        restart_web_stream ? "1" : "0",
+        wall_log,
         NULL
     };
     for (int i = 0; xw_args[i]; i++)
@@ -229,7 +295,19 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     g_ptr_array_add(argv, g_strdup("--framedrop=vo"));
 
     if (mute) g_ptr_array_add(argv, g_strdup("--no-audio"));
-    if (loop) g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+    if (loop && !is_stream) g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+
+    if (is_stream) {
+        if (url_is_direct_stream(media)) {
+            /* Let mpv/FFmpeg handle direct stream continuity itself. */
+            if (!g_str_has_prefix(media, "rtsp://"))
+                g_ptr_array_add(argv, g_strdup("--network-timeout=15"));
+        } else {
+            /* Webpage URLs such as YouTube use mpv's yt-dlp hook. */
+            g_ptr_array_add(argv, g_strdup("--ytdl=yes"));
+            g_ptr_array_add(argv, g_strdup("--script-opts=ytdl_hook-try_ytdl_first=yes"));
+        }
+    }
     /* Software libavfilter blur needs CPU frames. GIFs are normally decoded in
      * software already, while MP4/H.264 often uses hardware decoding. Force
      * software decoding only when blur is active so the filter behaves
@@ -272,7 +350,7 @@ static gboolean start_wallpaper(gboolean require_enabled) {
         g_ptr_array_add(argv, g_strdup("--panscan=1.0"));
     }
 
-    g_ptr_array_add(argv, g_strdup(video));
+    g_ptr_array_add(argv, g_strdup(media));
     g_ptr_array_add(argv, NULL);
 
     GPid child = 0;
@@ -298,7 +376,10 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     }
 
     g_ptr_array_free(argv, TRUE);
+    g_free(wall_log);
+    g_free(source);
     g_free(video);
+    g_free(stream_url);
     g_free(mode);
     g_key_file_unref(kf);
     g_free(cfg);

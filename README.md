@@ -7,10 +7,6 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 > **Version:** 0.1.0  
 > **Status:** early release. X11 only.
 
-## Demo
-
-![Animated Wallpaper settings UI](awdemo.webp)
-
 ## Features
 
 - Native GTK3 settings app integrated with Xfce Settings Manager
@@ -138,3 +134,11 @@ The backend therefore launches `mpv` through a small shell adapter. `xwinwrap` r
 ## License
 
 MIT
+
+
+## Stream sources
+
+Stream mode supports direct network media such as HLS (`.m3u8`), DASH, RTSP, and direct media URLs.
+
+Web video page URLs such as YouTube can also be opened through `yt-dlp`, but this path is **experimental** and may freeze, stall, or reconnect during long playback. For continuous wallpaper use, direct stream URLs are recommended when available.
+
