@@ -1,12 +1,16 @@
 #include <gtk/gtk.h>
 #include <glib/gstdio.h>
+#include <gtk/gtkx.h>
+#include <signal.h>
+#include <stdio.h>
+#include <sys/wait.h>
 
 typedef struct {
     GtkWidget *window;
     GtkWidget *file_button;
     GtkWidget *preview_stack;
     GtkWidget *preview_eventbox;
-    GtkWidget *preview_image;
+    GtkWidget *preview_area;
     GtkWidget *preview_label;
     GtkWidget *speed_scale;
     GtkWidget *mode_fill;
@@ -30,6 +34,9 @@ typedef struct {
     gboolean status_active;
     gboolean enabled;
     gboolean loading;
+    GPid preview_pid;
+    guint preview_restart_source;
+    gboolean preview_restart_pending;
 } App;
 
 static gchar *config_dir(void) {
@@ -38,10 +45,6 @@ static gchar *config_dir(void) {
 
 static gchar *config_path(void) {
     return g_build_filename(g_get_user_config_dir(), "xfce-animated-wallpaper", "config.ini", NULL);
-}
-
-static gchar *preview_path(void) {
-    return g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", "preview.jpg", NULL);
 }
 
 static gchar *autostart_path(void) {
@@ -181,75 +184,278 @@ static void set_autostart(gboolean enabled) {
     g_free(path);
 }
 
+static gboolean restart_preview_cb(gpointer data);
+
+static void preview_child_exited(GPid pid, gint status, gpointer data) {
+    App *app = data;
+    gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+    g_mkdir_with_parents(cache_dir, 0700);
+    gchar *debug_path = g_build_filename(cache_dir, "preview-debug.log", NULL);
+    gchar *line = g_strdup_printf("preview child exited: pid=%ld status=%d exited=%d exit_code=%d signaled=%d term_sig=%d\n",
+                                  (long)pid, status,
+                                  WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                                  WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    FILE *fp = fopen(debug_path, "a");
+    if (fp) { fputs(line, fp); fclose(fp); }
+    g_free(line);
+    g_free(debug_path);
+    g_free(cache_dir);
+
+    if (app->preview_pid == pid)
+        app->preview_pid = 0;
+    g_spawn_close_pid(pid);
+
+    if (app->preview_restart_pending && app->preview_restart_source == 0)
+        app->preview_restart_source = g_timeout_add(120, restart_preview_cb, app);
+}
+
+static void stop_preview(App *app) {
+    app->preview_restart_pending = FALSE;
+    if (app->preview_restart_source) {
+        g_source_remove(app->preview_restart_source);
+        app->preview_restart_source = 0;
+    }
+    if (app->preview_pid > 0) {
+        kill(app->preview_pid, SIGTERM);
+    }
+}
+
 static void show_preview_message(App *app, const gchar *message) {
+    stop_preview(app);
     gtk_label_set_text(GTK_LABEL(app->preview_label), message);
     gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
 }
 
 static void update_preview(App *app) {
+    gchar *cache_dir_debug = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+    g_mkdir_with_parents(cache_dir_debug, 0700);
+    gchar *debug_path = g_build_filename(cache_dir_debug, "preview-debug.log", NULL);
+    gchar *debug_line = g_strdup_printf("update_preview: realized=%d mapped=%d\n",
+                                        gtk_widget_get_realized(app->preview_area),
+                                        gtk_widget_get_mapped(app->preview_area));
+    g_file_set_contents(debug_path, debug_line, -1, NULL);
+    g_free(debug_line);
+    g_free(debug_path);
+    g_free(cache_dir_debug);
+
     gchar *video = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
-    if (!video || !*video) {
+    if (!video || !*video || !g_file_test(video, G_FILE_TEST_IS_REGULAR)) {
         show_preview_message(app, "Click the preview to choose an animated wallpaper");
         g_free(video);
         return;
     }
 
-    gchar *ffmpeg = g_find_program_in_path("ffmpeg");
-    if (!ffmpeg) {
-        show_preview_message(app, "Install ffmpeg to generate preview thumbnails");
+    if (!gtk_widget_get_realized(app->preview_area)) {
         g_free(video);
         return;
     }
 
-    gchar *out = preview_path();
-    gchar *out_dir = g_path_get_dirname(out);
-    g_mkdir_with_parents(out_dir, 0700);
+    GdkDisplay *display = gtk_widget_get_display(app->preview_area);
+    if (!display || !GDK_IS_X11_DISPLAY(display)) {
+        show_preview_message(app, "Animated preview requires X11");
+        g_free(video);
+        return;
+    }
 
-    gchar *argv[] = {
-        ffmpeg,
-        "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", "2",
-        "-i", video,
-        "-frames:v", "1",
-        "-vf", "scale=240:135:force_original_aspect_ratio=decrease",
-        out,
-        NULL
-    };
+    gchar *mpv = g_find_program_in_path("mpv");
+    if (!mpv) {
+        show_preview_message(app, "Install mpv to show the animated preview");
+        g_free(video);
+        return;
+    }
+
+    Window xid = gtk_socket_get_id(GTK_SOCKET(app->preview_area));
+    {
+        gchar *cache_dir2 = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+        g_mkdir_with_parents(cache_dir2, 0700);
+        gchar *debug_path2 = g_build_filename(cache_dir2, "preview-debug.log", NULL);
+        gchar *line2 = g_strdup_printf("preview target: xid=0x%lx (%lu) video=%s\n",
+                                       (unsigned long)xid, (unsigned long)xid, video);
+        FILE *fp2 = fopen(debug_path2, "a");
+        if (fp2) { fputs(line2, fp2); fclose(fp2); }
+        g_free(line2); g_free(debug_path2); g_free(cache_dir2);
+    }
+    if (xid == 0) {
+        show_preview_message(app, "Could not create the preview window");
+        g_free(mpv);
+        g_free(video);
+        return;
+    }
+    gchar *xid_arg = g_strdup_printf("%lu", (unsigned long)xid);
+
+    /* mpv command-line numbers must always use a dot as the decimal
+     * separator.  GTK initializes the user's locale, so ordinary printf
+     * formatting would produce e.g. 1,0 under sv_SE and mpv rejects it. */
+    gchar speed_num[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar brightness_num[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar contrast_num[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar saturation_num[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar blur_num[G_ASCII_DTOSTR_BUF_SIZE];
+
+    g_ascii_formatd(speed_num, sizeof speed_num, "%.1f",
+                    gtk_range_get_value(GTK_RANGE(app->speed_scale)));
+    g_ascii_formatd(brightness_num, sizeof brightness_num, "%.0f",
+                    gtk_range_get_value(GTK_RANGE(app->brightness_scale)));
+    g_ascii_formatd(contrast_num, sizeof contrast_num, "%.0f",
+                    gtk_range_get_value(GTK_RANGE(app->contrast_scale)));
+    g_ascii_formatd(saturation_num, sizeof saturation_num, "%.0f",
+                    gtk_range_get_value(GTK_RANGE(app->saturation_scale)));
+
+    gchar *speed_arg = g_strdup_printf("--speed=%s", speed_num);
+    gchar *brightness_arg = g_strdup_printf("--brightness=%s", brightness_num);
+    gchar *contrast_arg = g_strdup_printf("--contrast=%s", contrast_num);
+    gchar *saturation_arg = g_strdup_printf("--saturation=%s", saturation_num);
+
+    gdouble blur = gtk_range_get_value(GTK_RANGE(app->blur_scale));
+    gchar *blur_arg = NULL;
+    if (blur > 0.01) {
+        g_ascii_formatd(blur_num, sizeof blur_num, "%.2f", blur);
+        blur_arg = g_strdup_printf("--vf-add=lavfi=[gblur=sigma=%s]", blur_num);
+    }
+
+    gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+    g_mkdir_with_parents(cache_dir, 0700);
+    gchar *log_path = g_build_filename(cache_dir, "preview-mpv.log", NULL);
+
+    /*
+     * Use the same shell adapter pattern as the wallpaper backend.  This keeps
+     * the XID as a plain positional parameter and lets the shell construct the
+     * --wid=<id> form required by current mpv versions.  stdout/stderr go to a
+     * persistent log so preview failures are diagnosable.
+     */
+    GPtrArray *argv = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(argv, g_strdup("sh"));
+    g_ptr_array_add(argv, g_strdup("-c"));
+    g_ptr_array_add(argv, g_strdup(
+        "log=$1; wid=$2; shift 2; "
+        ": >\"$log\"; "
+        "exec mpv --wid=\"$wid\" \"$@\" >>\"$log\" 2>&1"));
+    g_ptr_array_add(argv, g_strdup("sh"));
+    g_ptr_array_add(argv, g_strdup(log_path));
+    g_ptr_array_add(argv, xid_arg);
+    g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+    g_ptr_array_add(argv, g_strdup("--no-audio"));
+    g_ptr_array_add(argv, g_strdup("--no-osc"));
+    g_ptr_array_add(argv, g_strdup("--no-input-default-bindings"));
+    g_ptr_array_add(argv, g_strdup("--msg-level=all=info"));
+    g_ptr_array_add(argv, g_strdup("--force-window=yes"));
+    g_ptr_array_add(argv, speed_arg);
+    g_ptr_array_add(argv, brightness_arg);
+    g_ptr_array_add(argv, contrast_arg);
+    g_ptr_array_add(argv, saturation_arg);
+
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->interpolation_check))) {
+        g_ptr_array_add(argv, g_strdup("--interpolation=yes"));
+        g_ptr_array_add(argv, g_strdup("--video-sync=display-resample"));
+    }
+
+    if (blur_arg) {
+        g_ptr_array_add(argv, blur_arg);
+        g_ptr_array_add(argv, g_strdup("--hwdec=no"));
+    } else if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->hwdec_check))) {
+        g_ptr_array_add(argv, g_strdup("--hwdec=auto-safe"));
+    } else {
+        g_ptr_array_add(argv, g_strdup("--hwdec=no"));
+    }
+
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_stretch))) {
+        g_ptr_array_add(argv, g_strdup("--keepaspect=no"));
+    } else if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_fit))) {
+        g_ptr_array_add(argv, g_strdup("--keepaspect=yes"));
+        g_ptr_array_add(argv, g_strdup("--panscan=0.0"));
+    } else {
+        g_ptr_array_add(argv, g_strdup("--keepaspect=yes"));
+        g_ptr_array_add(argv, g_strdup("--panscan=1.0"));
+    }
+
+    g_ptr_array_add(argv, g_strdup(video));
+    g_ptr_array_add(argv, NULL);
 
     GError *err = NULL;
-    gint status = 0;
-    gchar *stderr_text = NULL;
-    gboolean spawned = g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL,
-                                    NULL, &stderr_text, &status, &err);
-
-    /* Very short clips may not have a frame at 2 seconds. Retry at the start. */
-    if (!spawned || !g_spawn_check_wait_status(status, NULL)) {
-        if (err) g_clear_error(&err);
-        g_clear_pointer(&stderr_text, g_free);
-        argv[5] = "0";
-        spawned = g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL,
-                               NULL, &stderr_text, &status, &err);
-    }
-
-    if (spawned && g_spawn_check_wait_status(status, NULL)) {
-        GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale(out, 240, 135, TRUE, &err);
-        if (pixbuf) {
-            gtk_image_set_from_pixbuf(GTK_IMAGE(app->preview_image), pixbuf);
-            gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "image");
-            g_object_unref(pixbuf);
-        } else {
-            show_preview_message(app, "Could not load the generated preview");
-        }
+    GPid pid = 0;
+    gboolean ok = g_spawn_async(NULL, (gchar **)argv->pdata, NULL,
+                                G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                                NULL, NULL, &pid, &err);
+    if (ok) {
+        app->preview_pid = pid;
+        g_child_watch_add(pid, preview_child_exited, app);
+        gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "video");
+        gchar *cache_dir3 = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+        gchar *debug_path3 = g_build_filename(cache_dir3, "preview-debug.log", NULL);
+        gchar *line3 = g_strdup_printf("preview spawn ok: pid=%ld\n", (long)pid);
+        FILE *fp3 = fopen(debug_path3, "a");
+        if (fp3) { fputs(line3, fp3); fclose(fp3); }
+        g_free(line3); g_free(debug_path3); g_free(cache_dir3);
     } else {
-        show_preview_message(app, "Could not generate a preview for this wallpaper");
+        gchar *msg = g_strdup_printf("Could not start preview: %s", err ? err->message : "unknown error");
+        gtk_label_set_text(GTK_LABEL(app->preview_label), msg);
+        gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
+        g_free(msg);
+        g_clear_error(&err);
     }
 
-    if (err) g_clear_error(&err);
-    g_free(stderr_text);
-    g_free(out_dir);
-    g_free(out);
-    g_free(ffmpeg);
+    g_ptr_array_free(argv, TRUE);
+    g_free(log_path);
+    g_free(cache_dir);
+    g_free(mpv);
     g_free(video);
+}
+
+static gboolean restart_preview_cb(gpointer data) {
+    App *app = data;
+    app->preview_restart_source = 0;
+    if (app->preview_pid > 0)
+        return G_SOURCE_REMOVE;
+    app->preview_restart_pending = FALSE;
+    update_preview(app);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_preview_restart(App *app) {
+    app->preview_restart_pending = TRUE;
+    if (app->preview_restart_source) {
+        g_source_remove(app->preview_restart_source);
+        app->preview_restart_source = 0;
+    }
+    if (app->preview_pid > 0) {
+        kill(app->preview_pid, SIGTERM);
+        return;
+    }
+    app->preview_restart_source = g_timeout_add(120, restart_preview_cb, app);
+}
+
+
+static gboolean on_preview_plug_removed(GtkSocket *socket, gpointer data) {
+    (void)socket;
+    App *app = data;
+    if (app->preview_restart_pending && app->preview_pid == 0 && app->preview_restart_source == 0)
+        app->preview_restart_source = g_timeout_add(120, restart_preview_cb, app);
+    return TRUE;
+}
+
+static void on_preview_realize(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    schedule_preview_restart((App *)data);
+}
+
+static gboolean on_window_focus_in(GtkWidget *widget, GdkEventFocus *event, gpointer data) {
+    (void)widget; (void)event;
+    App *app = data;
+    if (app->preview_pid > 0) kill(app->preview_pid, SIGCONT);
+    return FALSE;
+}
+
+static gboolean on_window_focus_out(GtkWidget *widget, GdkEventFocus *event, gpointer data) {
+    (void)widget; (void)event;
+    App *app = data;
+    if (app->preview_pid > 0) kill(app->preview_pid, SIGSTOP);
+    return FALSE;
+}
+
+static void on_window_destroy(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    stop_preview((App *)data);
+    gtk_main_quit();
 }
 
 
@@ -533,8 +739,8 @@ static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpo
         gchar *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(app->file_button), filename);
-            update_preview(app);
-            save_config(app);
+            /* GtkFileChooserButton emits file-set; that callback saves the
+             * config and restarts the preview once. */
             g_free(filename);
         }
     }
@@ -548,13 +754,14 @@ static void on_setting_changed(GtkWidget *widget, gpointer data) {
     App *app = data;
     if (app->loading) return;
     save_config(app);
+    schedule_preview_restart(app);
 }
 
 static void on_file_set(GtkFileChooserButton *button, gpointer data) {
     (void)button;
     App *app = data;
     if (app->loading) return;
-    update_preview(app);
+    schedule_preview_restart(app);
     save_config(app);
 }
 
@@ -650,7 +857,7 @@ static void load_config(App *app) {
     g_free(path);
 
     app->loading = FALSE;
-    update_preview(app);
+    schedule_preview_restart(app);
     update_status(app);
 }
 
@@ -710,15 +917,19 @@ int main(int argc, char **argv) {
 
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app.window), "Animated Wallpaper");
-    gtk_window_set_default_size(GTK_WINDOW(app.window), 680, 850);
+    gtk_window_set_default_size(GTK_WINDOW(app.window), 920, 650);
     gtk_container_set_border_width(GTK_CONTAINER(app.window), 18);
-    g_signal_connect(app.window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    g_signal_connect(app.window, "destroy", G_CALLBACK(on_window_destroy), &app);
+    g_signal_connect(app.window, "focus-in-event", G_CALLBACK(on_window_focus_in), &app);
+    g_signal_connect(app.window, "focus-out-event", G_CALLBACK(on_window_focus_out), &app);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
     gtk_container_add(GTK_CONTAINER(app.window), root);
 
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
+    gtk_box_pack_start(GTK_BOX(root), content, TRUE, TRUE, 0);
+
     GtkWidget *notebook = gtk_notebook_new();
-    gtk_box_pack_start(GTK_BOX(root), notebook, TRUE, TRUE, 0);
 
     GtkWidget *general_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(general_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
@@ -732,8 +943,11 @@ int main(int argc, char **argv) {
     gtk_widget_set_hexpand(app.preview_stack, FALSE);
     gtk_widget_set_vexpand(app.preview_stack, FALSE);
     gtk_widget_set_halign(app.preview_stack, GTK_ALIGN_CENTER);
-    app.preview_image = gtk_image_new();
-    gtk_stack_add_named(GTK_STACK(app.preview_stack), app.preview_image, "image");
+    app.preview_area = gtk_socket_new();
+    gtk_widget_set_size_request(app.preview_area, 240, 135);
+    gtk_widget_set_hexpand(app.preview_area, FALSE);
+    gtk_widget_set_vexpand(app.preview_area, FALSE);
+    gtk_stack_add_named(GTK_STACK(app.preview_stack), app.preview_area, "video");
     app.preview_label = gtk_label_new("Choose a wallpaper to preview it");
     gtk_widget_set_hexpand(app.preview_label, TRUE);
     gtk_widget_set_vexpand(app.preview_label, TRUE);
@@ -755,7 +969,10 @@ int main(int argc, char **argv) {
     gtk_widget_set_vexpand(preview_frame, FALSE);
     gtk_widget_set_margin_top(preview_frame, 10);
     gtk_widget_set_margin_bottom(preview_frame, 10);
-    gtk_box_pack_start(GTK_BOX(general), preview_frame, FALSE, FALSE, 0);
+    /* Keep the live preview outside the notebook so it remains visible on every tab. */
+    gtk_widget_set_valign(preview_frame, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(content), preview_frame, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
 
     app.file_button = gtk_file_chooser_button_new("Choose animated wallpaper", GTK_FILE_CHOOSER_ACTION_OPEN);
     GtkFileFilter *filter = gtk_file_filter_new();
@@ -901,6 +1118,8 @@ int main(int argc, char **argv) {
     gtk_widget_set_size_request(set_wallpaper, -1, 44);
     gtk_box_pack_start(GTK_BOX(root), set_wallpaper, FALSE, FALSE, 0);
 
+    g_signal_connect(app.preview_area, "realize", G_CALLBACK(on_preview_realize), &app);
+    g_signal_connect(app.preview_area, "plug-removed", G_CALLBACK(on_preview_plug_removed), &app);
     g_signal_connect(app.preview_eventbox, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
     g_signal_connect(gallery_button, "clicked", G_CALLBACK(on_gallery_clicked), &app);
     g_signal_connect(app.file_button, "file-set", G_CALLBACK(on_file_set), &app);
@@ -926,6 +1145,15 @@ int main(int argc, char **argv) {
 
     load_config(&app);
     gtk_widget_show_all(app.window);
+
+    /*
+     * load_config() runs before widgets are realized.  Starting the preview
+     * there can therefore see no native X11 window yet.  Queue an explicit
+     * retry after the complete settings window has been mapped instead of
+     * relying solely on GtkSocket::realize.
+     */
+    app.preview_restart_source = g_timeout_add(100, restart_preview_cb, &app);
+
     gtk_main();
     return 0;
 }

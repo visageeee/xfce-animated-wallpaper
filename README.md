@@ -1,235 +1,135 @@
 # Xfce Animated Wallpaper
 
-A lightweight animated wallpaper utility for **Xfce on X11**, built around `xwinwrap` and `mpv`.
+A lightweight GTK3 settings app for using videos, GIFs and other animated media as desktop backgrounds on **Xfce/X11**, powered by `xwinwrap` and `mpv`.
 
-It provides a GTK3 settings application integrated with the Xfce Settings Manager, allowing animated wallpapers to be configured without manually constructing `xwinwrap` and `mpv` commands.
+The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desktop background underneath the animated layer, so turning it off immediately restores your regular desktop background.
+
+> **Version:** 0.1.0  
+> **Status:** early release. X11 only.
 
 ## Features
 
-- Play videos, GIFs, and other mpv-supported media as the desktop background
-- Native GTK3 settings interface
-- Integration with the Xfce Settings Manager
-- Wallpaper preview
-- Click the preview to select a wallpaper
-- Thumbnail gallery for visually browsing wallpapers
-- Fill, Fit, and Stretch scaling modes
-- Adjustable playback speed
-- Optional video looping
-- Start automatically when you log in
-- Quickly return to the normal Xfce desktop background
-- Status indicator showing whether the animated wallpaper is active
+- Native GTK3 settings app integrated with Xfce Settings Manager
+- Video, GIF and APNG wallpaper support through `mpv`
+- Clickable wallpaper preview
+- Thumbnail gallery for visually choosing wallpapers
+- **Set Wallpaper** applies changes explicitly; editing settings does not restart the wallpaper
+- **Turn Off** returns to the normal Xfce desktop background
+- Fill, Fit and Stretch scaling modes
+- Playback speed control in 0.1× increments
+- Loop wallpaper video
+- Optional start on login
+- Safe Xfce autostart that waits for the desktop before launching
+- Running-state indicator
 
 ### Advanced settings
 
-- Frame interpolation for smoother motion
-- Pause automatically when another application is fullscreen
-- Pause automatically while running on battery
+- Frame interpolation / smooth motion
+- Pause while another application is fullscreen
+- Pause while running on battery
 - Hardware decoding
-- Optional FPS limit
-- Brightness adjustment
-- Contrast adjustment
-- Saturation adjustment
-- Blur
+- FPS limit
+- Brightness
+- Contrast
+- Saturation
+- Gaussian blur
+- Reset settings to defaults
 
-Settings are stored in:
-
-```text
-~/.config/xfce-animated-wallpaper/config.ini
-```
-
-Generated preview thumbnails are cached under:
-
-```text
-~/.cache/xfce-animated-wallpaper/
-```
-
-## How it works
-
-Xfce Animated Wallpaper uses `xwinwrap` to create a desktop-level X11 window and embeds `mpv` into it.
-
-The settings application controls a separate backend process:
-
-```bash
-xfce-animated-wallpaper start
-xfce-animated-wallpaper stop
-xfce-animated-wallpaper restart
-xfce-animated-wallpaper status
-```
-
-The GTK application itself does not need to remain open after setting a wallpaper.
-
-When **Set Wallpaper** is pressed, the current settings are saved and the animated wallpaper is started.
-
-When **Turn Off** is pressed, `xwinwrap` and `mpv` are stopped and the normal Xfce desktop background is revealed again.
-
-## Known limitations
-
-### Desktop icons
-
-**Desktop icons are not currently visible while an animated wallpaper is active.**
-
-Xfdesktop draws the desktop background and desktop icons in the same X11 window. Xfce Animated Wallpaper uses `xwinwrap` to embed an `mpv` video surface into the Xfce desktop, and that surface is displayed above xfdesktop's own drawing, including its icons.
-
-The icons are not disabled, moved, or deleted. Turning off the animated wallpaper immediately reveals the normal Xfce desktop background and desktop icons again.
-
-Preserving native xfdesktop icons while displaying the animated wallpaper would require a different approach or changes to xfdesktop itself.
-
-### X11 only
-
-Xfce Animated Wallpaper currently targets **Xfce running under X11**.
-
-Wayland sessions are not supported because the application relies on X11 window embedding through `xwinwrap`.
+Fullscreen and battery pausing suspend the `mpv` process and resume it in place, so playback continues from the same point without rebuilding the wallpaper window.
 
 ## Requirements
 
-The application requires:
+The project is intended for **Xfce running under X11**.
 
-- Xfce
-- X11
-- GTK3
-- GLib
-- `xwinwrap`
-- `mpv`
-- `ffmpeg`
-- `xprop`
-
-On Ubuntu and Debian-based systems, most build/runtime dependencies can be installed with:
+Ubuntu / Xubuntu / Debian build and runtime dependencies:
 
 ```bash
-sudo apt install \
-    build-essential \
-    libgtk-3-dev \
-    libglib2.0-dev \
-    mpv \
-    ffmpeg \
-    x11-utils
+sudo apt install build-essential libgtk-3-dev libglib2.0-dev mpv ffmpeg x11-utils
 ```
 
-`xwinwrap` may need to be installed separately if it is not provided by your distribution.
+You also need `xwinwrap` installed and available in your `PATH`.
 
-## Building
+`ffmpeg` is used to generate preview and gallery thumbnails. `xprop` from `x11-utils` is used for fullscreen detection.
 
-Clone the repository:
+## Build and install
 
 ```bash
-git clone https://github.com/visageeee/xfce-animated-wallpaper.git
+git clone <repository-url>
 cd xfce-animated-wallpaper
-```
-
-Build:
-
-```bash
 make
-```
-
-Install system-wide:
-
-```bash
 sudo make install
 ```
 
-The default installation prefix is:
-
-```text
-/usr/local
-```
-
-## Running
-
-After installation, open:
+Then open:
 
 **Xfce Settings Manager → Animated Wallpaper**
 
-Or launch the settings application directly:
+or run:
 
 ```bash
 xfce-animated-wallpaper-settings
 ```
 
-The backend can also be controlled manually:
+To uninstall:
+
+```bash
+sudo make uninstall
+```
+
+## Usage
+
+Choose an animated wallpaper using the file chooser, clickable preview, or Gallery. Adjust the settings you want, then press **Set Wallpaper**.
+
+Changing controls only updates the saved configuration. The currently running wallpaper is not changed until **Set Wallpaper** is pressed.
+
+Press **Turn Off** to stop the animated wallpaper and return to the desktop background configured by Xfce.
+
+If **Start when you log in** is enabled, the wallpaper is restored on login only if it was left active. Turning it off keeps it off at the next login.
+
+## Backend commands
+
+The GUI uses a small backend that can also be controlled directly:
 
 ```bash
 xfce-animated-wallpaper start
 xfce-animated-wallpaper stop
 xfce-animated-wallpaper restart
 xfce-animated-wallpaper status
+xfce-animated-wallpaper autostart
 ```
 
-## Start when you log in
+## Files
 
-The settings application can create an Xfce autostart entry.
+Configuration:
 
-When enabled, the application waits briefly for the X11 session and `xfdesktop` to become ready before starting the animated wallpaper.
+```text
+~/.config/xfce-animated-wallpaper/config.ini
+```
 
-If the desktop is not ready, startup fails safely and leaves the normal Xfce desktop background in place.
+Preview and gallery thumbnail cache:
 
-The autostart file is stored at:
+```text
+~/.cache/xfce-animated-wallpaper/
+```
+
+Autostart entry, when enabled:
 
 ```text
 ~/.config/autostart/xfce-animated-wallpaper.desktop
 ```
 
-Turning off the animated wallpaper also marks it inactive, so it will not unexpectedly start again on the next login.
+## How xwinwrap and mpv are connected
 
-## Fullscreen and battery pausing
+`xwinwrap` and modern `mpv` disagree on how the target window ID is passed: `xwinwrap` substitutes its `WID` placeholder when it is a standalone argument, while `mpv` expects `--wid=<id>`.
 
-The animated wallpaper can automatically pause when another application enters fullscreen.
+The backend therefore launches `mpv` through a small shell adapter. `xwinwrap` replaces the standalone `WID`, and the adapter passes the resulting value to `mpv` in the form it expects.
 
-Instead of destroying and recreating the wallpaper, the backend pauses the `mpv` process and resumes it when the fullscreen application is closed or leaves fullscreen. This avoids unnecessary video decoding and allows the wallpaper to resume immediately from the same position.
+## Limitations
 
-There is also an option to pause the wallpaper while the computer is running on battery power.
-
-## Wallpaper gallery
-
-The built-in gallery provides a thumbnail view for browsing animated wallpapers.
-
-By default, it opens the directory containing the currently selected wallpaper. If no wallpaper has been selected, it starts in:
-
-```text
-~/Pictures
-```
-
-Thumbnail images are generated with `ffmpeg` and cached locally so they do not need to be regenerated every time the settings application is opened.
-
-## Performance
-
-Animated wallpapers naturally consume more resources than a static desktop background.
-
-For lower resource usage:
-
-- Enable hardware decoding
-- Set an FPS limit
-- Leave blur disabled
-- Enable fullscreen pausing
-- Enable battery pausing on laptops
-
-Some video filters, particularly blur, require software-decoded frames and may therefore increase CPU usage.
-
-Frame interpolation can also increase GPU usage depending on the video, display refresh rate, and mpv configuration.
-
-## Uninstalling
-
-Run:
-
-```bash
-sudo make uninstall
-```
-
-User configuration can optionally be removed with:
-
-```bash
-rm -rf ~/.config/xfce-animated-wallpaper
-rm -rf ~/.cache/xfce-animated-wallpaper
-rm -f ~/.config/autostart/xfce-animated-wallpaper.desktop
-```
-
-## Project status
-
-This is an early project and currently targets Xfce/X11 systems.
-
-It was originally built as a small utility for making animated wallpapers convenient to configure and use from within Xfce rather than as a general-purpose wallpaper system.
-
-Bug reports, testing on different Xfce/X11 setups, and contributions are welcome.
+- X11 only; this is not a Wayland wallpaper implementation.
+- Currently designed around a single fullscreen desktop wallpaper rather than separate media per monitor.
+- Blur requires software-decoded frames and may increase CPU usage.
+- Gallery thumbnail generation can take a moment the first time a folder is opened; thumbnails are cached afterward.
 
 ## License
 
