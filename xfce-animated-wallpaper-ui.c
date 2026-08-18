@@ -38,6 +38,7 @@ typedef struct {
     GtkWidget *status_indicator;
     GtkWidget *turn_off_button;
     gboolean status_active;
+    gboolean settings_dirty;
     guint status_poll_source;
     gboolean enabled;
     gboolean loading;
@@ -46,8 +47,11 @@ typedef struct {
     gchar *applied_source;
     GPid preview_pid;
     guint preview_restart_source;
+    guint preview_aspect_source;
     gboolean preview_restart_pending;
 } App;
+
+static gboolean source_is_stream(App *app);
 
 static gchar *config_dir(void) {
     return g_build_filename(g_get_user_config_dir(), "xfce-animated-wallpaper", NULL);
@@ -86,7 +90,9 @@ static gboolean draw_status_indicator(GtkWidget *widget, cairo_t *cr, gpointer u
     gtk_widget_get_allocation(widget, &a);
     gdouble r = MIN(a.width, a.height) * 0.34;
     cairo_arc(cr, a.width / 2.0, a.height / 2.0, r, 0, 2 * G_PI);
-    if (app->status_active)
+    if (app->status_active && app->settings_dirty)
+        cairo_set_source_rgb(cr, 0.92, 0.68, 0.12);
+    else if (app->status_active)
         cairo_set_source_rgb(cr, 0.20, 0.72, 0.30);
     else
         cairo_set_source_rgb(cr, 0.82, 0.20, 0.20);
@@ -139,12 +145,30 @@ static void update_status(App *app) {
     gchar *out = NULL;
     app->status_active = command_sync("status", &out) && out && g_str_has_prefix(out, "running");
 
-    if (app->status_active) {
-        gtk_label_set_text(GTK_LABEL(app->status_label), "Animated wallpaper is active");
+    if (app->status_active && app->settings_dirty) {
+        gtk_label_set_text(GTK_LABEL(app->status_label),
+                           "Press \"Set Wallpaper\" to apply settings");
+    } else if (app->status_active) {
+        const gchar *kind =
+            (app->applied_source && g_strcmp0(app->applied_source, "stream") == 0)
+                ? "Web source"
+                : "Local file";
+        gchar *status = g_strdup_printf("Animated wallpaper is active — %s", kind);
+        gtk_label_set_text(GTK_LABEL(app->status_label), status);
+        g_free(status);
     } else if (app->enabled) {
         gchar *friendly = read_wallpaper_error();
-        gtk_label_set_text(GTK_LABEL(app->status_label),
-                           friendly ? friendly : "Animated wallpaper stopped unexpectedly");
+        if (friendly) {
+            gtk_label_set_text(GTK_LABEL(app->status_label), friendly);
+        } else {
+            const gchar *kind =
+                (app->applied_source && g_strcmp0(app->applied_source, "stream") == 0)
+                    ? "web source"
+                    : "local file";
+            gchar *status = g_strdup_printf("Animated wallpaper stopped unexpectedly (%s)", kind);
+            gtk_label_set_text(GTK_LABEL(app->status_label), status);
+            g_free(status);
+        }
         g_free(friendly);
     } else {
         gtk_label_set_text(GTK_LABEL(app->status_label), "Using Xfce desktop background");
@@ -233,6 +257,9 @@ static void reset_defaults(App *app) {
     gtk_range_set_value(GTK_RANGE(app->blur_scale), 0.0);
 
     app->loading = FALSE;
+    app->settings_dirty = TRUE;
+    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
+    update_status(app);
     save_config(app);
 }
 
@@ -373,8 +400,74 @@ static void update_source_controls(App *app) {
 
     gtk_widget_set_sensitive(app->file_button, !stream);
     gtk_widget_set_sensitive(app->stream_entry, stream);
-    gtk_widget_set_sensitive(app->reconnect_check, stream);
+    gtk_widget_set_visible(app->reconnect_check, stream);
     gtk_widget_set_sensitive(app->loop_check, !stream);
+}
+
+
+
+static void set_preview_aspect(App *app, gdouble aspect) {
+    if (aspect <= 0.01)
+        aspect = 16.0 / 9.0;
+
+    /*
+     * Keep the preview width fixed.  Error/message labels must never be able
+     * to widen the preview column; monitor aspect only changes its height.
+     */
+    const gint width = 240;
+    gint height = (gint)(width / aspect + 0.5);
+
+    /* Avoid absurd heights on portrait/extreme displays while preserving the
+     * fixed-width behavior. */
+    height = CLAMP(height, 80, 240);
+
+    gtk_widget_set_size_request(app->preview_stack, width, height);
+    gtk_widget_set_size_request(app->preview_area, width, height);
+}
+
+static gdouble current_monitor_aspect(App *app) {
+    if (!app->window)
+        return 16.0 / 9.0;
+
+    GdkWindow *window = gtk_widget_get_window(app->window);
+    if (!window)
+        return 16.0 / 9.0;
+
+    GdkDisplay *display = gdk_window_get_display(window);
+    if (!display)
+        return 16.0 / 9.0;
+
+    GdkMonitor *monitor = gdk_display_get_monitor_at_window(display, window);
+    if (!monitor)
+        return 16.0 / 9.0;
+
+    GdkRectangle geometry;
+    gdk_monitor_get_geometry(monitor, &geometry);
+
+    if (geometry.width <= 0 || geometry.height <= 0)
+        return 16.0 / 9.0;
+
+    return (gdouble)geometry.width / (gdouble)geometry.height;
+}
+
+static gboolean update_preview_aspect_cb(gpointer data) {
+    App *app = data;
+    app->preview_aspect_source = 0;
+    set_preview_aspect(app, current_monitor_aspect(app));
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_preview_aspect_update(App *app) {
+    if (app->preview_aspect_source)
+        g_source_remove(app->preview_aspect_source);
+    app->preview_aspect_source = g_timeout_add(60, update_preview_aspect_cb, app);
+}
+
+static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event, gpointer data) {
+    (void)widget;
+    (void)event;
+    schedule_preview_aspect_update((App *)data);
+    return FALSE;
 }
 
 static void update_preview(App *app) {
@@ -582,6 +675,7 @@ static gboolean restart_preview_cb(gpointer data) {
 }
 
 static void schedule_preview_restart(App *app) {
+    schedule_preview_aspect_update(app);
     app->preview_restart_pending = TRUE;
     if (app->preview_restart_source) {
         g_source_remove(app->preview_restart_source);
@@ -926,6 +1020,9 @@ static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpo
              * reliably emit "file-set", so explicitly use the same safe
              * preview restart path as the normal chooser/gallery.
              */
+            app->settings_dirty = TRUE;
+            if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
+            update_status(app);
             schedule_preview_restart(app);
             save_config(app);
 
@@ -942,7 +1039,10 @@ static void on_source_toggled(GtkToggleButton *button, gpointer data) {
     App *app = data;
     if (!gtk_toggle_button_get_active(button) || app->loading)
         return;
+    app->settings_dirty = TRUE;
+    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
     update_source_controls(app);
+    update_status(app);
     save_config(app);
     schedule_preview_restart(app);
 }
@@ -951,6 +1051,9 @@ static void on_setting_changed(GtkWidget *widget, gpointer data) {
     (void)widget;
     App *app = data;
     if (app->loading) return;
+    app->settings_dirty = TRUE;
+    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
+    update_status(app);
     save_config(app);
     schedule_preview_restart(app);
 }
@@ -959,6 +1062,9 @@ static void on_file_set(GtkFileChooserButton *button, gpointer data) {
     (void)button;
     App *app = data;
     if (app->loading) return;
+    app->settings_dirty = TRUE;
+    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
+    update_status(app);
     schedule_preview_restart(app);
     save_config(app);
 }
@@ -1002,6 +1108,8 @@ static void on_set_clicked(GtkButton *button, gpointer data) {
         gtk_label_set_text(GTK_LABEL(app->status_label), "Could not start animated wallpaper");
         return;
     }
+    app->settings_dirty = FALSE;
+    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
     update_status(app);
 }
 
@@ -1009,8 +1117,10 @@ static void on_turn_off_clicked(GtkButton *button, gpointer data) {
     (void)button;
     App *app = data;
     app->enabled = FALSE;
+    app->settings_dirty = FALSE;
     save_config(app);
     command_sync("stop", NULL);
+    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
     update_status(app);
 }
 
@@ -1125,6 +1235,7 @@ static void load_config(App *app) {
     g_free(path);
 
     app->loading = FALSE;
+    app->settings_dirty = FALSE;
     schedule_preview_restart(app);
     update_status(app);
 }
@@ -1190,6 +1301,7 @@ int main(int argc, char **argv) {
     g_signal_connect(app.window, "destroy", G_CALLBACK(on_window_destroy), &app);
     g_signal_connect(app.window, "focus-in-event", G_CALLBACK(on_window_focus_in), &app);
     g_signal_connect(app.window, "focus-out-event", G_CALLBACK(on_window_focus_out), &app);
+    g_signal_connect(app.window, "configure-event", G_CALLBACK(on_window_configure), &app);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
     gtk_container_add(GTK_CONTAINER(app.window), root);
@@ -1217,12 +1329,12 @@ int main(int argc, char **argv) {
     gtk_widget_set_vexpand(app.preview_area, FALSE);
     gtk_stack_add_named(GTK_STACK(app.preview_stack), app.preview_area, "video");
     app.preview_label = gtk_label_new("Choose a wallpaper to preview it");
-    gtk_widget_set_hexpand(app.preview_label, TRUE);
-    gtk_widget_set_vexpand(app.preview_label, TRUE);
     gtk_widget_set_size_request(app.preview_label, 220, -1);
+    gtk_widget_set_hexpand(app.preview_label, FALSE);
+    gtk_widget_set_vexpand(app.preview_label, TRUE);
     gtk_label_set_line_wrap(GTK_LABEL(app.preview_label), TRUE);
     gtk_label_set_line_wrap_mode(GTK_LABEL(app.preview_label), PANGO_WRAP_WORD_CHAR);
-    gtk_label_set_max_width_chars(GTK_LABEL(app.preview_label), 30);
+    gtk_label_set_max_width_chars(GTK_LABEL(app.preview_label), 28);
     gtk_label_set_justify(GTK_LABEL(app.preview_label), GTK_JUSTIFY_CENTER);
     gtk_label_set_xalign(GTK_LABEL(app.preview_label), 0.5f);
     gtk_label_set_yalign(GTK_LABEL(app.preview_label), 0.5f);
@@ -1243,6 +1355,7 @@ int main(int argc, char **argv) {
     gtk_widget_set_hexpand(preview_frame, FALSE);
     gtk_widget_set_vexpand(preview_frame, FALSE);
     gtk_widget_set_size_request(preview_frame, 250, -1);
+    gtk_widget_set_size_request(app.preview_stack, 240, 135);
     gtk_widget_set_margin_top(preview_frame, 10);
     gtk_widget_set_margin_bottom(preview_frame, 10);
     /* Keep the live preview outside the notebook so it remains visible on every tab. */
@@ -1251,10 +1364,11 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
 
     GtkWidget *source_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_size_request(source_box, 270, -1);
     gtk_style_context_add_class(gtk_widget_get_style_context(source_box), "linked");
     app.source_local = gtk_radio_button_new_with_label(NULL, "Local file");
     GSList *source_group = gtk_radio_button_get_group(GTK_RADIO_BUTTON(app.source_local));
-    app.source_stream = gtk_radio_button_new_with_label(source_group, "Stream");
+    app.source_stream = gtk_radio_button_new_with_label(source_group, "Web URL");
     gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(app.source_local), FALSE);
     gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(app.source_stream), FALSE);
     gtk_widget_set_size_request(app.source_local, 120, 30);
@@ -1263,7 +1377,7 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(source_box), app.source_stream, TRUE, TRUE, 0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.source_local), TRUE);
     gtk_box_pack_start(GTK_BOX(general),
-                       row("Source", "Choose a local animated file or a network/web video source.",
+                       row("Wallpaper Source", "Choose a local animated file or a web video source.",
                            source_box),
                        FALSE, FALSE, 0);
 
@@ -1279,13 +1393,14 @@ int main(int argc, char **argv) {
     gtk_file_filter_add_pattern(filter, "*.APNG");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(app.file_button), filter);
     GtkWidget *picker_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_size_request(picker_box, 270, -1);
     gtk_widget_set_size_request(app.file_button, -1, 30);
     gtk_box_pack_start(GTK_BOX(picker_box), app.file_button, TRUE, TRUE, 0);
     GtkWidget *gallery_button = gtk_button_new_with_label("Gallery...");
     gtk_widget_set_tooltip_text(gallery_button, "Browse a folder as a grid of animated wallpaper thumbnails");
     gtk_widget_set_size_request(gallery_button, -1, 30);
     gtk_box_pack_start(GTK_BOX(picker_box), gallery_button, FALSE, FALSE, 0);
-    app.wallpaper_row = row("Wallpaper",
+    app.wallpaper_row = row("Wallpaper file",
                             "Choose a video, GIF, APNG, or another animated format supported by mpv.",
                             picker_box);
     gtk_box_pack_start(GTK_BOX(general), app.wallpaper_row, FALSE, FALSE, 0);
@@ -1295,7 +1410,7 @@ int main(int argc, char **argv) {
                                    "https://example.com/live/stream.m3u8");
     gtk_widget_set_size_request(app.stream_entry, 360, 30);
     app.stream_row = row(
-        "Stream URL",
+        "Wallpaper URL",
         "Direct streams such as HLS (.m3u8), DASH, RTSP, or media URLs are recommended. "
         "Web video URLs such as YouTube are supported through yt-dlp but are experimental and may freeze or reconnect.",
         app.stream_entry);
@@ -1334,7 +1449,6 @@ int main(int argc, char **argv) {
     for (gdouble mark = 0.2; mark <= 2.0001; mark += 0.1)
         gtk_scale_add_mark(GTK_SCALE(app.speed_scale), mark, GTK_POS_BOTTOM, NULL);
     gtk_scale_set_value_pos(GTK_SCALE(app.speed_scale), GTK_POS_RIGHT);
-    gtk_box_pack_start(GTK_BOX(general), row("Playback speed", "Useful for slowing down subtle ambient loops.", app.speed_scale), FALSE, FALSE, 0);
 
     GtkWidget *general_checks = centered_check_group();
     app.mute_check = gtk_check_button_new_with_label("Mute audio");
@@ -1375,6 +1489,7 @@ int main(int argc, char **argv) {
 
     app.fps_spin = gtk_spin_button_new_with_range(0, 240, 1);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(app.fps_spin), TRUE);
+    gtk_box_pack_start(GTK_BOX(advanced), row("Playback speed", "Useful for slowing down subtle ambient loops.", app.speed_scale), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(advanced), row("FPS limit", "0 uses the wallpaper's normal frame rate.", app.fps_spin), FALSE, FALSE, 0);
 
     app.brightness_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, -100, 100, 1);
@@ -1462,6 +1577,7 @@ int main(int argc, char **argv) {
 
     load_config(&app);
     gtk_widget_show_all(app.window);
+    schedule_preview_aspect_update(&app);
     app.status_poll_source = g_timeout_add_seconds(2, status_poll_cb, &app);
     update_source_controls(&app);
 
