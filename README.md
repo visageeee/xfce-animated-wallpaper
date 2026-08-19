@@ -1,16 +1,17 @@
 # Xfce Animated Wallpaper
 
-A lightweight GTK3 settings app for using videos, GIFs and other animated media as desktop backgrounds on **Xfce/X11**, powered by `xwinwrap` and `mpv`.
+A lightweight GTK3 settings app for using videos, animated media, web sources and static images as desktop backgrounds on **Xfce/X11**, powered by `xwinwrap` and `mpv`.
 
 The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desktop background underneath the animated layer, so turning it off immediately restores your regular desktop background.
 
-> **Version:** 0.1.0  
+> **Version:** 0.3.0  
 > **Status:** early release. X11 only.
 
 ## Features
 
 - Native GTK3 settings app integrated with Xfce Settings Manager
-- Video, GIF and APNG wallpaper support through `mpv`
+- Video, GIF, APNG and static image wallpaper support
+- Web URL sources, including direct network streams and experimental web-video support through `yt-dlp`
 - Clickable wallpaper preview
 - Thumbnail gallery for visually choosing wallpapers
 - **Set Wallpaper** applies changes explicitly; editing settings does not restart the wallpaper
@@ -24,15 +25,13 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 
 ### Effects
 
-The **Effects** tab applies GPU shaders through mpv's renderer. Built-in effects currently include:
+The **Effects** tab applies GPU shaders through mpv's renderer. Effects are modular and discovered at runtime, and individual effects can expose their own adjustable parameters such as strength, speed, scale or intensity.
 
-- GPU blur
-- Vignette
-- Film grain
-- Chromatic aberration
-- CRT-style scanlines
+Built-in effects include blur, vignette, film grain, chromatic aberration, scanlines, wave distortion, dream diffusion, bloom and ripple-style animated effects.
 
-These effects remain compatible with hardware video decoding and replace the older CPU-heavy FFmpeg Gaussian blur path.
+For graphics-driver stability, only one GPU effect can be active at a time. Enabling one effect automatically disables the others.
+
+Static images can also use animated effects. PNG, JPEG, WebP, BMP and TIFF sources are accepted. To give frame-driven shaders a normal animation clock without repeatedly decoding the original image, static images are automatically converted once to a short 30 FPS H.264 cache video and then looped like an ordinary wallpaper video.
 
 ### Advanced settings
 
@@ -44,7 +43,6 @@ These effects remain compatible with hardware video decoding and replace the old
 - Brightness
 - Contrast
 - Saturation
-- Gaussian blur
 - Reset settings to defaults
 
 Fullscreen and battery pausing suspend the `mpv` process and resume it in place, so playback continues from the same point without rebuilding the wallpaper window.
@@ -61,7 +59,7 @@ sudo apt install build-essential libgtk-3-dev libglib2.0-dev mpv ffmpeg x11-util
 
 You also need `xwinwrap` installed and available in your `PATH`.
 
-`ffmpeg` is used to generate preview and gallery thumbnails. `xprop` from `x11-utils` is used for fullscreen detection.
+`ffmpeg` is used to generate preview/gallery thumbnails and the cached 30 FPS videos used for animated static-image wallpapers. `xprop` from `x11-utils` is used for fullscreen detection.
 
 ## Build and install
 
@@ -90,7 +88,7 @@ sudo make uninstall
 
 ## Usage
 
-Choose an animated wallpaper using the file chooser, clickable preview, or Gallery. Adjust the settings you want, then press **Set Wallpaper**.
+Choose a video, animated image or static image using the file chooser, clickable preview, or Gallery, or select **Web URL** and enter a network source. Adjust the settings you want, then press **Set Wallpaper**.
 
 Changing controls only updates the saved configuration. The currently running wallpaper is not changed until **Set Wallpaper** is pressed.
 
@@ -118,10 +116,16 @@ Configuration:
 ~/.config/xfce-animated-wallpaper/config.ini
 ```
 
-Preview and gallery thumbnail cache:
+Preview, gallery thumbnail and generated static-image video cache:
 
 ```text
 ~/.cache/xfce-animated-wallpaper/
+```
+
+Cached videos generated from static images are stored under:
+
+```text
+~/.cache/xfce-animated-wallpaper/static-videos/
 ```
 
 Autostart entry, when enabled:
@@ -140,7 +144,7 @@ The backend therefore launches `mpv` through a small shell adapter. `xwinwrap` r
 
 - X11 only; this is not a Wayland wallpaper implementation.
 - Currently designed around a single fullscreen desktop wallpaper rather than separate media per monitor.
-- Blur requires software-decoded frames and may increase CPU usage.
+- GPU effects add rendering load; particularly expensive shaders may noticeably increase GPU usage.
 - Gallery thumbnail generation can take a moment the first time a folder is opened; thumbnails are cached afterward.
 
 ## License
@@ -155,9 +159,6 @@ Stream mode supports direct network media such as HLS (`.m3u8`), DASH, RTSP, and
 Web video page URLs such as YouTube can also be opened through `yt-dlp`, but this path is **experimental** and may freeze, stall, or reconnect during long playback. For continuous wallpaper use, direct stream URLs are recommended when available.
 
 
-### Effect safety
-
-Only one GPU effect can be active at a time. Enabling one effect automatically resets the others to zero. This avoids unstable or excessively expensive shader chains on some graphics drivers.
 
 
 ## Custom effects
@@ -182,7 +183,7 @@ User effects can be installed without root under:
 ~/.local/share/xfce-animated-wallpaper/effects/
 ```
 
-A minimal `effect.ini` looks like:
+Each effect defines its metadata and controls in `effect.ini`; effects can expose a main strength control plus effect-specific sub-parameters. A minimal single-control `effect.ini` looks like:
 
 ```ini
 [Effect]
