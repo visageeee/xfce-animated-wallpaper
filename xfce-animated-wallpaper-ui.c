@@ -229,7 +229,10 @@ static EffectDef *effect_for_slider(App *app, GtkWidget *slider, EffectParam **o
             if (p->slider==slider) { if(out)*out=p; return e; }
         }
     }
-    if(out)*out=NULL; return NULL;
+    if (out)
+        *out = NULL;
+
+    return NULL;
 }
 static void load_effect_parameters(GKeyFile *kf, EffectDef *e) {
     gsize n=0; gchar **groups=g_key_file_get_groups(kf,&n);
@@ -777,10 +780,6 @@ static EffectDef *active_effect(App *app){
     }return NULL;
 }
 
-static void preview_child_setup(gpointer data) {
-    (void)data;
-    setpgid(0, 0);
-}
 
 static void update_preview(App *app) {
     gchar *cache_dir_debug = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
