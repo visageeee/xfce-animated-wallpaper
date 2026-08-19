@@ -3,6 +3,7 @@ CFLAGS ?= -O2 -Wall -Wextra
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 XFCE_SETTINGS_DIR ?= $(PREFIX)/share/applications
+EFFECT_DIR ?= $(PREFIX)/share/xfce-animated-wallpaper/effects
 
 GLIB_CFLAGS := $(shell pkg-config --cflags glib-2.0)
 GLIB_LIBS   := $(shell pkg-config --libs glib-2.0)
@@ -27,12 +28,15 @@ install: all
 	install -Dm755 xfce-animated-wallpaper $(DESTDIR)$(BINDIR)/xfce-animated-wallpaper
 	install -Dm755 xfce-animated-wallpaper-settings $(DESTDIR)$(BINDIR)/xfce-animated-wallpaper-settings
 	install -Dm644 xfce-animated-wallpaper-settings.desktop $(DESTDIR)$(XFCE_SETTINGS_DIR)/xfce-animated-wallpaper-settings.desktop
+	install -d $(DESTDIR)$(EFFECT_DIR)
+	cp -a effects/. $(DESTDIR)$(EFFECT_DIR)/
 	@echo "Installed. Open Xfce Settings Manager and choose Animated Wallpaper."
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/xfce-animated-wallpaper
 	rm -f $(DESTDIR)$(BINDIR)/xfce-animated-wallpaper-settings
 	rm -f $(DESTDIR)$(XFCE_SETTINGS_DIR)/xfce-animated-wallpaper-settings.desktop
+	rm -rf $(DESTDIR)$(EFFECT_DIR)
 
 clean:
 	rm -f xfce-animated-wallpaper xfce-animated-wallpaper-settings

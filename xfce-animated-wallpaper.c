@@ -7,6 +7,133 @@
 #include <unistd.h>
 #include <sys/types.h>
 
+
+typedef struct {gchar *id,*placeholder;gdouble min,default_value;gint order;} BackendParam;
+typedef struct {gchar *id,*shader_path;gint order;GPtrArray *params;} BackendEffect;
+static void backend_param_free(gpointer d){BackendParam*p=d;if(!p)return;g_free(p->id);g_free(p->placeholder);g_free(p);}
+static void backend_effect_free(gpointer d){BackendEffect*e=d;if(!e)return;g_free(e->id);g_free(e->shader_path);if(e->params)g_ptr_array_free(e->params,TRUE);g_free(e);}
+static gboolean backend_effect_loaded(GPtrArray*a,const gchar*id){for(guint i=0;a&&i<a->len;i++){BackendEffect*e=g_ptr_array_index(a,i);if(g_strcmp0(e->id,id)==0)return TRUE;}return FALSE;}
+static gint backend_effect_sort(gconstpointer a,gconstpointer b){const BackendEffect*ea=*(BackendEffect*const*)a,*eb=*(BackendEffect*const*)b;return ea->order!=eb->order?ea->order-eb->order:g_strcmp0(ea->id,eb->id);}
+static gint backend_param_sort(gconstpointer a,gconstpointer b){const BackendParam*pa=*(BackendParam*const*)a,*pb=*(BackendParam*const*)b;return pa->order-pb->order;}
+static BackendParam*backend_activation_param(BackendEffect*e){if(!e||!e->params||!e->params->len)return NULL;for(guint i=0;i<e->params->len;i++){BackendParam*p=g_ptr_array_index(e->params,i);if(g_strcmp0(p->id,"strength")==0)return p;}return g_ptr_array_index(e->params,0);}
+static void backend_load_params(GKeyFile*k,BackendEffect*e){gsize n=0;gchar**g=g_key_file_get_groups(k,&n);for(gsize i=0;g&&i<n;i++){if(!g_str_has_prefix(g[i],"Parameter "))continue;const gchar*id=g[i]+strlen("Parameter ");if(!*id)continue;BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup(id);p->placeholder=g_key_file_has_key(k,g[i],"placeholder",NULL)?g_key_file_get_string(k,g[i],"placeholder",NULL):g_ascii_strup(id,-1);p->min=g_key_file_has_key(k,g[i],"min",NULL)?g_key_file_get_double(k,g[i],"min",NULL):0;p->default_value=g_key_file_has_key(k,g[i],"default",NULL)?g_key_file_get_double(k,g[i],"default",NULL):p->min;p->order=g_key_file_has_key(k,g[i],"order",NULL)?g_key_file_get_integer(k,g[i],"order",NULL):1000;g_ptr_array_add(e->params,p);}g_strfreev(g);if(!e->params->len){BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup("strength");p->placeholder=g_strdup("VALUE");p->min=g_key_file_has_key(k,"Effect","min",NULL)?g_key_file_get_double(k,"Effect","min",NULL):0;p->default_value=g_key_file_has_key(k,"Effect","default",NULL)?g_key_file_get_double(k,"Effect","default",NULL):p->min;g_ptr_array_add(e->params,p);}g_ptr_array_sort(e->params,backend_param_sort);}
+static void backend_load_effect_dir(GPtrArray*a,const gchar*base){if(!base||!g_file_test(base,G_FILE_TEST_IS_DIR))return;GDir*d=g_dir_open(base,0,NULL);if(!d)return;const gchar*n;while((n=g_dir_read_name(d))){gchar*f=g_build_filename(base,n,NULL),*m=g_build_filename(f,"effect.ini",NULL);if(!g_file_test(m,G_FILE_TEST_IS_REGULAR)){g_free(m);g_free(f);continue;}GKeyFile*k=g_key_file_new();if(!g_key_file_load_from_file(k,m,G_KEY_FILE_NONE,NULL)){g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*id=g_key_file_get_string(k,"Effect","id",NULL),*sn=g_key_file_get_string(k,"Effect","shader",NULL);if(!id||!*id||!sn||!*sn||backend_effect_loaded(a,id)){g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*sp=g_build_filename(f,sn,NULL);if(!g_file_test(sp,G_FILE_TEST_IS_REGULAR)){g_free(sp);g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}BackendEffect*e=g_new0(BackendEffect,1);e->id=id;e->shader_path=sp;e->order=g_key_file_has_key(k,"Effect","order",NULL)?g_key_file_get_integer(k,"Effect","order",NULL):1000;e->params=g_ptr_array_new_with_free_func(backend_param_free);backend_load_params(k,e);g_ptr_array_add(a,e);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);}g_dir_close(d);}
+static GPtrArray*backend_discover_effects(void){GPtrArray*a=g_ptr_array_new_with_free_func(backend_effect_free);gchar*u=g_build_filename(g_get_user_data_dir(),"xfce-animated-wallpaper","effects",NULL);backend_load_effect_dir(a,u);g_free(u);backend_load_effect_dir(a,"./effects");backend_load_effect_dir(a,"/usr/local/share/xfce-animated-wallpaper/effects");backend_load_effect_dir(a,"/usr/share/xfce-animated-wallpaper/effects");g_ptr_array_sort(a,backend_effect_sort);return a;}
+
+
+static gboolean path_is_static_image(const gchar *path) {
+    if (!path || !*path)
+        return FALSE;
+
+    gchar *lower = g_ascii_strdown(path, -1);
+    gboolean image =
+        g_str_has_suffix(lower, ".png")  ||
+        g_str_has_suffix(lower, ".jpg")  ||
+        g_str_has_suffix(lower, ".jpeg") ||
+        g_str_has_suffix(lower, ".webp") ||
+        g_str_has_suffix(lower, ".bmp")  ||
+        g_str_has_suffix(lower, ".tif")  ||
+        g_str_has_suffix(lower, ".tiff");
+
+    g_free(lower);
+    return image;
+}
+
+
+
+
+
+static gchar *static_image_cache_video(const gchar *image_path, GError **error) {
+    if (!image_path || !*image_path)
+        return NULL;
+
+    GStatBuf st;
+    if (g_stat(image_path, &st) != 0) {
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                    "Could not stat image: %s", image_path);
+        return NULL;
+    }
+
+    gchar *key_src = g_strdup_printf("%s|%" G_GINT64_FORMAT "|%" G_GINT64_FORMAT,
+                                     image_path,
+                                     (gint64)st.st_mtime,
+                                     (gint64)st.st_size);
+    gchar *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, key_src, -1);
+    g_free(key_src);
+
+    gchar *cache_dir = g_build_filename(g_get_user_cache_dir(),
+                                        "xfce-animated-wallpaper",
+                                        "static-videos", NULL);
+    g_mkdir_with_parents(cache_dir, 0700);
+
+    gchar *name = g_strdup_printf("%s.mp4", hash);
+    gchar *out = g_build_filename(cache_dir, name, NULL);
+
+    g_free(name);
+    g_free(hash);
+
+    if (g_file_test(out, G_FILE_TEST_IS_REGULAR)) {
+        g_free(cache_dir);
+        return out;
+    }
+
+    gchar *tmp = g_strdup_printf("%s.tmp.mp4", out);
+    gchar *quoted_in = g_shell_quote(image_path);
+    gchar *quoted_out = g_shell_quote(tmp);
+
+    /*
+     * Build one second of 30 FPS H.264 from the still image. The result is
+     * tiny, hardware-decodable on typical GPUs, and loops like any normal
+     * wallpaper video. yuv420p maximizes decoder compatibility.
+     */
+    gchar *cmd = g_strdup_printf(
+        "ffmpeg -hide_banner -loglevel error -y "
+        "-loop 1 -framerate 30 -i %s "
+        "-t 1 -an -vf \"fps=30,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p\" "
+        "-c:v libx264 -preset veryfast -crf 18 "
+        "-g 30 -keyint_min 30 -movflags +faststart %s",
+        quoted_in, quoted_out);
+
+    gint status = 0;
+    gchar *stderr_text = NULL;
+    gboolean ok = g_spawn_command_line_sync(cmd, NULL, &stderr_text, &status, error);
+
+    g_free(cmd);
+    g_free(quoted_in);
+    g_free(quoted_out);
+
+    if (!ok || status != 0) {
+        if (error && !*error) {
+            g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                        "ffmpeg could not prepare static image%s%s",
+                        stderr_text && *stderr_text ? ": " : "",
+                        stderr_text && *stderr_text ? stderr_text : "");
+        }
+        g_free(stderr_text);
+        g_unlink(tmp);
+        g_free(tmp);
+        g_free(out);
+        g_free(cache_dir);
+        return NULL;
+    }
+
+    g_free(stderr_text);
+
+    if (g_rename(tmp, out) != 0) {
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                    "Could not finalize cached static wallpaper video.");
+        g_unlink(tmp);
+        g_free(tmp);
+        g_free(out);
+        g_free(cache_dir);
+        return NULL;
+    }
+
+    g_free(tmp);
+    g_free(cache_dir);
+    return out;
+}
+
 static gchar *config_path(void) {
     return g_build_filename(g_get_user_config_dir(), "xfce-animated-wallpaper", "config.ini", NULL);
 }
@@ -176,6 +303,12 @@ static gboolean url_is_direct_stream(const gchar *url) {
     return direct;
 }
 
+
+
+static gdouble backend_param_value(GKeyFile*k,BackendEffect*e,BackendParam*p){gchar*g=g_strdup_printf("effect.%s",e->id);gdouble v=p->default_value;if(g_key_file_has_key(k,g,p->id,NULL))v=g_key_file_get_double(k,g,p->id,NULL);else if(p==backend_activation_param(e)&&g_key_file_has_key(k,"effects",e->id,NULL))v=g_key_file_get_double(k,"effects",e->id,NULL);g_free(g);return v;}
+static gchar*materialize_effect_shader(GKeyFile*k,BackendEffect*e){gchar*r=NULL;if(!e||!g_file_get_contents(e->shader_path,&r,NULL,NULL))return NULL;for(guint i=0;i<e->params->len;i++){BackendParam*p=g_ptr_array_index(e->params,i);gchar v[G_ASCII_DTOSTR_BUF_SIZE];g_ascii_formatd(v,sizeof v,"%.6f",backend_param_value(k,e,p));gchar*t=g_strdup_printf("@%s@",p->placeholder);gchar**parts=g_strsplit(r,t,-1);gchar*next=g_strjoinv(v,parts);g_strfreev(parts);g_free(t);g_free(r);r=next;}gchar*d=g_build_filename(g_get_user_cache_dir(),"xfce-animated-wallpaper","shaders",NULL);g_mkdir_with_parents(d,0700);gchar*n=g_strdup_printf("%s-generated.glsl",e->id),*path=g_build_filename(d,n,NULL);if(!g_file_set_contents(path,r,-1,NULL)){g_free(path);path=NULL;}g_free(n);g_free(d);g_free(r);return path;}
+static void add_backend_effect_shader(GPtrArray*a,GKeyFile*k,BackendEffect*e){gchar*p=materialize_effect_shader(k,e);if(!p)return;g_ptr_array_add(a,g_strdup_printf("--glsl-shader=%s",p));g_free(p);}
+
 static gboolean start_wallpaper(gboolean require_enabled) {
     gchar *cfg = config_path();
     GKeyFile *kf = g_key_file_new();
@@ -227,7 +360,6 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     gdouble brightness = get_double(kf, "advanced", "brightness", 0.0);
     gdouble contrast = get_double(kf, "advanced", "contrast", 0.0);
     gdouble saturation = get_double(kf, "advanced", "saturation", 0.0);
-    gdouble blur = get_double(kf, "advanced", "blur", 0.0);
 
     gboolean is_stream = g_strcmp0(source, "stream") == 0;
     const gchar *media = is_stream ? stream_url : video;
@@ -295,7 +427,34 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     g_ptr_array_add(argv, g_strdup("--framedrop=vo"));
 
     if (mute) g_ptr_array_add(argv, g_strdup("--no-audio"));
-    if (loop && !is_stream) g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+    gchar *play_media = NULL;
+    gchar *static_cache = NULL;
+
+    if (!is_stream && path_is_static_image(media)) {
+        GError *cache_err = NULL;
+        static_cache = static_image_cache_video(media, &cache_err);
+        if (!static_cache) {
+            g_printerr("Could not prepare static wallpaper: %s\n",
+                       cache_err ? cache_err->message : "unknown error");
+            g_clear_error(&cache_err);
+            g_ptr_array_free(argv, TRUE);
+    g_free(static_cache);
+            g_free(wall_log);
+            g_free(source);
+            g_free(video);
+            g_free(stream_url);
+            g_free(mode);
+            g_key_file_unref(kf);
+            g_free(cfg);
+            return FALSE;
+        }
+        g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+        play_media = g_strdup(static_cache);
+    } else {
+        if (loop && !is_stream)
+            g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+        play_media = g_strdup(media);
+    }
 
     if (is_stream) {
         if (url_is_direct_stream(media)) {
@@ -308,14 +467,13 @@ static gboolean start_wallpaper(gboolean require_enabled) {
             g_ptr_array_add(argv, g_strdup("--script-opts=ytdl_hook-try_ytdl_first=yes"));
         }
     }
-    /* Software libavfilter blur needs CPU frames. GIFs are normally decoded in
-     * software already, while MP4/H.264 often uses hardware decoding. Force
-     * software decoding only when blur is active so the filter behaves
-     * consistently across formats. */
-    if (blur > 0.01)
-        g_ptr_array_add(argv, g_strdup("--hwdec=no"));
-    else if (hwdec)
+    if (hwdec)
         g_ptr_array_add(argv, g_strdup("--hwdec=auto-safe"));
+    else
+        g_ptr_array_add(argv, g_strdup("--hwdec=no"));
+
+    GPtrArray *effects=backend_discover_effects();
+    for(guint i=0;effects&&i<effects->len;i++){BackendEffect*e=g_ptr_array_index(effects,i);BackendParam*p=backend_activation_param(e);if(!p)continue;gdouble v=backend_param_value(kf,e,p);if(v>p->min+0.001){add_backend_effect_shader(argv,kf,e);break;}}
     if (interpolation) {
         g_ptr_array_add(argv, g_strdup("--interpolation=yes"));
         g_ptr_array_add(argv, g_strdup("--video-sync=display-resample"));
@@ -327,10 +485,6 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     g_ptr_array_add(argv, brightness_arg);
     g_ptr_array_add(argv, contrast_arg);
     g_ptr_array_add(argv, saturation_arg);
-    if (blur > 0.01) {
-        gchar *blur_arg = g_strdup_printf("--vf-add=lavfi=[gblur=sigma=%.2f]", CLAMP(blur, 0.0, 20.0));
-        g_ptr_array_add(argv, blur_arg);
-    }
 
     gchar *speed_arg = g_strdup_printf("--speed=%.3f", CLAMP(speed, 0.05, 4.0));
     g_ptr_array_add(argv, speed_arg);
@@ -350,7 +504,7 @@ static gboolean start_wallpaper(gboolean require_enabled) {
         g_ptr_array_add(argv, g_strdup("--panscan=1.0"));
     }
 
-    g_ptr_array_add(argv, g_strdup(media));
+    g_ptr_array_add(argv, play_media);
     g_ptr_array_add(argv, NULL);
 
     GPid child = 0;
@@ -376,6 +530,8 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     }
 
     g_ptr_array_free(argv, TRUE);
+    if (effects)
+        g_ptr_array_free(effects, TRUE);
     g_free(wall_log);
     g_free(source);
     g_free(video);

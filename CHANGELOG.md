@@ -1,3 +1,9 @@
+- Add Wave Distortion, Dream Diffusion, and Bloom GPU effects.
+- Fix Film Grain shader color corruption and make Scanlines visibly render on mpv GPU output.
+- Bake effect strengths into generated GLSL files instead of relying on mpv runtime shader parameters.
+- Make Blur and Vignette strength adjustable through mpv shader parameters.
+- Fix leaked preview mpv processes by managing the preview process group.
+- Add an Effects tab with GPU shader blur, vignette, grain, chromatic aberration, and scanlines.
 ## 0.2.0
 
 - Add user-facing stream error reporting for HTTP 403, yt-dlp failures, unreachable streams, and unexpected playback exits.

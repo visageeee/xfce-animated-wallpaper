@@ -3,7 +3,22 @@
 #include <gtk/gtkx.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/wait.h>
+
+
+typedef struct {
+    gchar *id, *name, *placeholder;
+    gdouble min, max, step, default_value;
+    gint digits, order;
+    GtkWidget *slider;
+} EffectParam;
+
+typedef struct {
+    gchar *id, *name, *description, *shader_path;
+    gint order;
+    GPtrArray *params;
+} EffectDef;
 
 typedef struct {
     GtkWidget *window;
@@ -33,12 +48,13 @@ typedef struct {
     GtkWidget *brightness_scale;
     GtkWidget *contrast_scale;
     GtkWidget *saturation_scale;
-    GtkWidget *blur_scale;
     GtkWidget *status_label;
     GtkWidget *status_indicator;
     GtkWidget *turn_off_button;
     gboolean status_active;
     gboolean settings_dirty;
+    gboolean changing_effects;
+    GPtrArray *effects;
     guint status_poll_source;
     gboolean enabled;
     gboolean loading;
@@ -51,7 +67,240 @@ typedef struct {
     gboolean preview_restart_pending;
 } App;
 
+
+static gboolean path_is_static_image(const gchar *path) {
+    if (!path || !*path)
+        return FALSE;
+
+    gchar *lower = g_ascii_strdown(path, -1);
+    gboolean image =
+        g_str_has_suffix(lower, ".png")  ||
+        g_str_has_suffix(lower, ".jpg")  ||
+        g_str_has_suffix(lower, ".jpeg") ||
+        g_str_has_suffix(lower, ".webp") ||
+        g_str_has_suffix(lower, ".bmp")  ||
+        g_str_has_suffix(lower, ".tif")  ||
+        g_str_has_suffix(lower, ".tiff");
+
+    g_free(lower);
+    return image;
+}
+
+
+
+
+
+static gchar *static_image_cache_video(const gchar *image_path, GError **error) {
+    if (!image_path || !*image_path)
+        return NULL;
+
+    GStatBuf st;
+    if (g_stat(image_path, &st) != 0) {
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                    "Could not stat image: %s", image_path);
+        return NULL;
+    }
+
+    gchar *key_src = g_strdup_printf("%s|%" G_GINT64_FORMAT "|%" G_GINT64_FORMAT,
+                                     image_path,
+                                     (gint64)st.st_mtime,
+                                     (gint64)st.st_size);
+    gchar *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, key_src, -1);
+    g_free(key_src);
+
+    gchar *cache_dir = g_build_filename(g_get_user_cache_dir(),
+                                        "xfce-animated-wallpaper",
+                                        "static-videos", NULL);
+    g_mkdir_with_parents(cache_dir, 0700);
+
+    gchar *name = g_strdup_printf("%s.mp4", hash);
+    gchar *out = g_build_filename(cache_dir, name, NULL);
+
+    g_free(name);
+    g_free(hash);
+
+    if (g_file_test(out, G_FILE_TEST_IS_REGULAR)) {
+        g_free(cache_dir);
+        return out;
+    }
+
+    gchar *tmp = g_strdup_printf("%s.tmp.mp4", out);
+    gchar *quoted_in = g_shell_quote(image_path);
+    gchar *quoted_out = g_shell_quote(tmp);
+
+    /*
+     * Build one second of 30 FPS H.264 from the still image. The result is
+     * tiny, hardware-decodable on typical GPUs, and loops like any normal
+     * wallpaper video. yuv420p maximizes decoder compatibility.
+     */
+    gchar *cmd = g_strdup_printf(
+        "ffmpeg -hide_banner -loglevel error -y "
+        "-loop 1 -framerate 30 -i %s "
+        "-t 1 -an -vf \"fps=30,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p\" "
+        "-c:v libx264 -preset veryfast -crf 18 "
+        "-g 30 -keyint_min 30 -movflags +faststart %s",
+        quoted_in, quoted_out);
+
+    gint status = 0;
+    gchar *stderr_text = NULL;
+    gboolean ok = g_spawn_command_line_sync(cmd, NULL, &stderr_text, &status, error);
+
+    g_free(cmd);
+    g_free(quoted_in);
+    g_free(quoted_out);
+
+    if (!ok || status != 0) {
+        if (error && !*error) {
+            g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                        "ffmpeg could not prepare static image%s%s",
+                        stderr_text && *stderr_text ? ": " : "",
+                        stderr_text && *stderr_text ? stderr_text : "");
+        }
+        g_free(stderr_text);
+        g_unlink(tmp);
+        g_free(tmp);
+        g_free(out);
+        g_free(cache_dir);
+        return NULL;
+    }
+
+    g_free(stderr_text);
+
+    if (g_rename(tmp, out) != 0) {
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                    "Could not finalize cached static wallpaper video.");
+        g_unlink(tmp);
+        g_free(tmp);
+        g_free(out);
+        g_free(cache_dir);
+        return NULL;
+    }
+
+    g_free(tmp);
+    g_free(cache_dir);
+    return out;
+}
+
 static gboolean source_is_stream(App *app);
+static void on_setting_changed(GtkWidget *widget, gpointer data);
+
+static void effect_param_free(gpointer data) {
+    EffectParam *p = data;
+    if (!p) return;
+    g_free(p->id); g_free(p->name); g_free(p->placeholder); g_free(p);
+}
+static void effect_def_free(gpointer data) {
+    EffectDef *e = data;
+    if (!e) return;
+    g_free(e->id); g_free(e->name); g_free(e->description); g_free(e->shader_path);
+    if (e->params) g_ptr_array_free(e->params, TRUE);
+    g_free(e);
+}
+static gint effect_sort(gconstpointer a, gconstpointer b) {
+    const EffectDef *ea = *(EffectDef * const *)a, *eb = *(EffectDef * const *)b;
+    if (ea->order != eb->order) return ea->order - eb->order;
+    return g_strcmp0(ea->name, eb->name);
+}
+static gint effect_param_sort(gconstpointer a, gconstpointer b) {
+    const EffectParam *pa = *(EffectParam * const *)a, *pb = *(EffectParam * const *)b;
+    if (pa->order != pb->order) return pa->order - pb->order;
+    return g_strcmp0(pa->name, pb->name);
+}
+static gboolean effect_id_loaded(GPtrArray *effects, const gchar *id) {
+    for (guint i=0; effects && i<effects->len; i++) {
+        EffectDef *e = g_ptr_array_index(effects,i);
+        if (g_strcmp0(e->id,id)==0) return TRUE;
+    }
+    return FALSE;
+}
+static EffectParam *effect_activation_param(EffectDef *e) {
+    if (!e || !e->params || !e->params->len) return NULL;
+    for (guint i=0;i<e->params->len;i++) {
+        EffectParam *p=g_ptr_array_index(e->params,i);
+        if (g_strcmp0(p->id,"strength")==0) return p;
+    }
+    return g_ptr_array_index(e->params,0);
+}
+static EffectDef *effect_for_slider(App *app, GtkWidget *slider, EffectParam **out) {
+    for (guint i=0; app->effects && i<app->effects->len; i++) {
+        EffectDef *e=g_ptr_array_index(app->effects,i);
+        for (guint j=0;j<e->params->len;j++) {
+            EffectParam *p=g_ptr_array_index(e->params,j);
+            if (p->slider==slider) { if(out)*out=p; return e; }
+        }
+    }
+    if(out)*out=NULL; return NULL;
+}
+static void load_effect_parameters(GKeyFile *kf, EffectDef *e) {
+    gsize n=0; gchar **groups=g_key_file_get_groups(kf,&n);
+    for (gsize i=0; groups && i<n; i++) {
+        if (!g_str_has_prefix(groups[i],"Parameter ")) continue;
+        const gchar *id=groups[i]+strlen("Parameter ");
+        if(!*id) continue;
+        EffectParam *p=g_new0(EffectParam,1);
+        p->id=g_strdup(id);
+        p->name=g_key_file_has_key(kf,groups[i],"name",NULL)?g_key_file_get_string(kf,groups[i],"name",NULL):g_strdup(id);
+        p->placeholder=g_key_file_has_key(kf,groups[i],"placeholder",NULL)?g_key_file_get_string(kf,groups[i],"placeholder",NULL):g_ascii_strup(id,-1);
+        p->min=g_key_file_has_key(kf,groups[i],"min",NULL)?g_key_file_get_double(kf,groups[i],"min",NULL):0;
+        p->max=g_key_file_has_key(kf,groups[i],"max",NULL)?g_key_file_get_double(kf,groups[i],"max",NULL):100;
+        p->step=g_key_file_has_key(kf,groups[i],"step",NULL)?g_key_file_get_double(kf,groups[i],"step",NULL):1;
+        p->default_value=g_key_file_has_key(kf,groups[i],"default",NULL)?g_key_file_get_double(kf,groups[i],"default",NULL):p->min;
+        p->digits=g_key_file_has_key(kf,groups[i],"digits",NULL)?g_key_file_get_integer(kf,groups[i],"digits",NULL):0;
+        p->order=g_key_file_has_key(kf,groups[i],"order",NULL)?g_key_file_get_integer(kf,groups[i],"order",NULL):1000;
+        g_ptr_array_add(e->params,p);
+    }
+    g_strfreev(groups);
+    if (!e->params->len) {
+        EffectParam *p=g_new0(EffectParam,1);
+        p->id=g_strdup("strength"); p->name=g_strdup("Strength"); p->placeholder=g_strdup("VALUE");
+        p->min=g_key_file_has_key(kf,"Effect","min",NULL)?g_key_file_get_double(kf,"Effect","min",NULL):0;
+        p->max=g_key_file_has_key(kf,"Effect","max",NULL)?g_key_file_get_double(kf,"Effect","max",NULL):100;
+        p->step=g_key_file_has_key(kf,"Effect","step",NULL)?g_key_file_get_double(kf,"Effect","step",NULL):1;
+        p->default_value=g_key_file_has_key(kf,"Effect","default",NULL)?g_key_file_get_double(kf,"Effect","default",NULL):p->min;
+        p->digits=g_key_file_has_key(kf,"Effect","digits",NULL)?g_key_file_get_integer(kf,"Effect","digits",NULL):0;
+        g_ptr_array_add(e->params,p);
+    }
+    g_ptr_array_sort(e->params,effect_param_sort);
+}
+static void load_effect_dir(GPtrArray *effects,const gchar *base) {
+    if(!base||!g_file_test(base,G_FILE_TEST_IS_DIR))return;
+    GDir *dir=g_dir_open(base,0,NULL); if(!dir)return;
+    const gchar *entry;
+    while((entry=g_dir_read_name(dir))) {
+        gchar *folder=g_build_filename(base,entry,NULL);
+        gchar *manifest=g_build_filename(folder,"effect.ini",NULL);
+        if(!g_file_test(manifest,G_FILE_TEST_IS_REGULAR)){g_free(manifest);g_free(folder);continue;}
+        GKeyFile *kf=g_key_file_new();
+        if(!g_key_file_load_from_file(kf,manifest,G_KEY_FILE_NONE,NULL)){g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;}
+        gchar *id=g_key_file_get_string(kf,"Effect","id",NULL);
+        gchar *name=g_key_file_get_string(kf,"Effect","name",NULL);
+        gchar *desc=g_key_file_get_string(kf,"Effect","description",NULL);
+        gchar *shader_name=g_key_file_get_string(kf,"Effect","shader",NULL);
+        if(!id||!*id||!name||!*name||!shader_name||!*shader_name||effect_id_loaded(effects,id)){
+            g_free(id);g_free(name);g_free(desc);g_free(shader_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;
+        }
+        gchar *shader=g_build_filename(folder,shader_name,NULL);
+        if(!g_file_test(shader,G_FILE_TEST_IS_REGULAR)){
+            g_free(shader);g_free(id);g_free(name);g_free(desc);g_free(shader_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;
+        }
+        EffectDef *e=g_new0(EffectDef,1);
+        e->id=id;e->name=name;e->description=desc?desc:g_strdup("");e->shader_path=shader;
+        e->order=g_key_file_has_key(kf,"Effect","order",NULL)?g_key_file_get_integer(kf,"Effect","order",NULL):1000;
+        e->params=g_ptr_array_new_with_free_func(effect_param_free);
+        load_effect_parameters(kf,e); g_ptr_array_add(effects,e);
+        g_free(shader_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);
+    }
+    g_dir_close(dir);
+}
+static GPtrArray *discover_effects(void) {
+    GPtrArray *effects=g_ptr_array_new_with_free_func(effect_def_free);
+    gchar *user=g_build_filename(g_get_user_data_dir(),"xfce-animated-wallpaper","effects",NULL);
+    load_effect_dir(effects,user);g_free(user);
+    load_effect_dir(effects,"./effects");
+    load_effect_dir(effects,"/usr/local/share/xfce-animated-wallpaper/effects");
+    load_effect_dir(effects,"/usr/share/xfce-animated-wallpaper/effects");
+    g_ptr_array_sort(effects,effect_sort); return effects;
+}
 
 static gchar *config_dir(void) {
     return g_build_filename(g_get_user_config_dir(), "xfce-animated-wallpaper", NULL);
@@ -222,7 +471,17 @@ static void save_config(App *app) {
     g_key_file_set_double(kf, "advanced", "brightness", gtk_range_get_value(GTK_RANGE(app->brightness_scale)));
     g_key_file_set_double(kf, "advanced", "contrast", gtk_range_get_value(GTK_RANGE(app->contrast_scale)));
     g_key_file_set_double(kf, "advanced", "saturation", gtk_range_get_value(GTK_RANGE(app->saturation_scale)));
-    g_key_file_set_double(kf, "advanced", "blur", gtk_range_get_value(GTK_RANGE(app->blur_scale)));
+    for (guint i=0; app->effects && i<app->effects->len; i++) {
+        EffectDef *e=g_ptr_array_index(app->effects,i);
+        gchar *group=g_strdup_printf("effect.%s",e->id);
+        for(guint j=0;j<e->params->len;j++){
+            EffectParam *p=g_ptr_array_index(e->params,j);
+            g_key_file_set_double(kf,group,p->id,gtk_range_get_value(GTK_RANGE(p->slider)));
+        }
+        EffectParam *a=effect_activation_param(e);
+        if(a)g_key_file_set_double(kf,"effects",e->id,gtk_range_get_value(GTK_RANGE(a->slider)));
+        g_free(group);
+    }
 
     gchar *dir = config_dir();
     g_mkdir_with_parents(dir, 0700);
@@ -254,7 +513,10 @@ static void reset_defaults(App *app) {
     gtk_range_set_value(GTK_RANGE(app->brightness_scale), 0.0);
     gtk_range_set_value(GTK_RANGE(app->contrast_scale), 0.0);
     gtk_range_set_value(GTK_RANGE(app->saturation_scale), 0.0);
-    gtk_range_set_value(GTK_RANGE(app->blur_scale), 0.0);
+    for(guint i=0;app->effects&&i<app->effects->len;i++){
+        EffectDef *e=g_ptr_array_index(app->effects,i);
+        for(guint j=0;j<e->params->len;j++){EffectParam *p=g_ptr_array_index(e->params,j);gtk_range_set_value(GTK_RANGE(p->slider),p->default_value);}
+    }
 
     app->loading = FALSE;
     app->settings_dirty = TRUE;
@@ -333,14 +595,27 @@ static void preview_child_exited(GPid pid, gint status, gpointer data) {
 }
 
 static void stop_preview(App *app) {
-    app->preview_restart_pending = FALSE;
-    if (app->preview_restart_source) {
-        g_source_remove(app->preview_restart_source);
-        app->preview_restart_source = 0;
+    if (!app->preview_pid)
+        return;
+
+    /*
+     * Preview is started in its own process group.  Kill the group, not just
+     * the shell/mpv PID, otherwise old embedded mpv children can survive
+     * repeated preview restarts.
+     */
+    kill(-app->preview_pid, SIGTERM);
+
+    for (int i = 0; i < 10; i++) {
+        if (kill(app->preview_pid, 0) != 0)
+            break;
+        g_usleep(50000);
     }
-    if (app->preview_pid > 0) {
-        kill(app->preview_pid, SIGTERM);
-    }
+
+    if (kill(app->preview_pid, 0) == 0)
+        kill(-app->preview_pid, SIGKILL);
+
+    g_spawn_close_pid(app->preview_pid);
+    app->preview_pid = 0;
 }
 
 static void show_preview_message(App *app, const gchar *message) {
@@ -470,6 +745,43 @@ static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event,
     return FALSE;
 }
 
+
+
+static gchar *materialize_effect_shader(EffectDef *effect) {
+    gchar *rendered=NULL;
+    if(!effect||!g_file_get_contents(effect->shader_path,&rendered,NULL,NULL))return NULL;
+    for(guint i=0;i<effect->params->len;i++){
+        EffectParam *p=g_ptr_array_index(effect->params,i);
+        gchar val[G_ASCII_DTOSTR_BUF_SIZE];
+        g_ascii_formatd(val,sizeof val,"%.6f",gtk_range_get_value(GTK_RANGE(p->slider)));
+        gchar *token=g_strdup_printf("@%s@",p->placeholder);
+        gchar **parts=g_strsplit(rendered,token,-1);
+        gchar *next=g_strjoinv(val,parts);
+        g_strfreev(parts);g_free(token);g_free(rendered);rendered=next;
+    }
+    gchar *dir=g_build_filename(g_get_user_cache_dir(),"xfce-animated-wallpaper","shaders",NULL);
+    g_mkdir_with_parents(dir,0700);
+    gchar *name=g_strdup_printf("%s-generated.glsl",effect->id);
+    gchar *path=g_build_filename(dir,name,NULL);
+    if(!g_file_set_contents(path,rendered,-1,NULL)){g_free(path);path=NULL;}
+    g_free(name);g_free(dir);g_free(rendered);return path;
+}
+static void add_effect_shader(GPtrArray *argv,EffectDef *effect){
+    gchar *path=materialize_effect_shader(effect);if(!path)return;
+    g_ptr_array_add(argv,g_strdup_printf("--glsl-shader=%s",path));g_free(path);
+}
+static EffectDef *active_effect(App *app){
+    for(guint i=0;app->effects&&i<app->effects->len;i++){
+        EffectDef *e=g_ptr_array_index(app->effects,i);EffectParam *p=effect_activation_param(e);
+        if(p&&gtk_range_get_value(GTK_RANGE(p->slider))>p->min+0.001)return e;
+    }return NULL;
+}
+
+static void preview_child_setup(gpointer data) {
+    (void)data;
+    setpgid(0, 0);
+}
+
 static void update_preview(App *app) {
     gchar *cache_dir_debug = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
     g_mkdir_with_parents(cache_dir_debug, 0700);
@@ -487,7 +799,7 @@ static void update_preview(App *app) {
         show_preview_message(app,
             source_is_stream(app)
                 ? "Enter a stream URL to preview it"
-                : "Click the preview to choose an animated wallpaper");
+                : "Click the preview to choose wallpaper media");
         g_free(video);
         return;
     }
@@ -537,7 +849,6 @@ static void update_preview(App *app) {
     gchar brightness_num[G_ASCII_DTOSTR_BUF_SIZE];
     gchar contrast_num[G_ASCII_DTOSTR_BUF_SIZE];
     gchar saturation_num[G_ASCII_DTOSTR_BUF_SIZE];
-    gchar blur_num[G_ASCII_DTOSTR_BUF_SIZE];
 
     g_ascii_formatd(speed_num, sizeof speed_num, "%.1f",
                     gtk_range_get_value(GTK_RANGE(app->speed_scale)));
@@ -553,12 +864,6 @@ static void update_preview(App *app) {
     gchar *contrast_arg = g_strdup_printf("--contrast=%s", contrast_num);
     gchar *saturation_arg = g_strdup_printf("--saturation=%s", saturation_num);
 
-    gdouble blur = gtk_range_get_value(GTK_RANGE(app->blur_scale));
-    gchar *blur_arg = NULL;
-    if (blur > 0.01) {
-        g_ascii_formatd(blur_num, sizeof blur_num, "%.2f", blur);
-        blur_arg = g_strdup_printf("--vf-add=lavfi=[gblur=sigma=%s]", blur_num);
-    }
 
     gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
     g_mkdir_with_parents(cache_dir, 0700);
@@ -580,9 +885,33 @@ static void update_preview(App *app) {
     g_ptr_array_add(argv, g_strdup("sh"));
     g_ptr_array_add(argv, g_strdup(log_path));
     g_ptr_array_add(argv, xid_arg);
-    if (!source_is_stream(app) &&
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->loop_check)))
-        g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+    gchar *preview_media = NULL;
+    gchar *preview_static_cache = NULL;
+
+    if (!source_is_stream(app) && path_is_static_image(video)) {
+        GError *cache_err = NULL;
+        preview_static_cache = static_image_cache_video(video, &cache_err);
+        if (preview_static_cache) {
+            g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+            preview_media = g_strdup(preview_static_cache);
+        } else {
+            gchar *msg = g_strdup_printf("Could not prepare static image: %s",
+                                         cache_err ? cache_err->message : "unknown error");
+            gtk_label_set_text(GTK_LABEL(app->preview_label), msg);
+            gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
+            g_free(msg);
+            g_clear_error(&cache_err);
+            g_ptr_array_free(argv, TRUE);
+            g_free(log_path);
+            g_free(video);
+            return;
+        }
+    } else {
+        if (!source_is_stream(app) &&
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->loop_check)))
+            g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+        preview_media = g_strdup(video);
+    }
 
     if (source_is_stream(app)) {
         if (url_is_direct_stream(video)) {
@@ -612,14 +941,15 @@ static void update_preview(App *app) {
         g_ptr_array_add(argv, g_strdup("--video-sync=display-resample"));
     }
 
-    if (blur_arg) {
-        g_ptr_array_add(argv, blur_arg);
-        g_ptr_array_add(argv, g_strdup("--hwdec=no"));
-    } else if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->hwdec_check))) {
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->hwdec_check)))
         g_ptr_array_add(argv, g_strdup("--hwdec=auto-safe"));
-    } else {
+    else
         g_ptr_array_add(argv, g_strdup("--hwdec=no"));
-    }
+
+    /* Built-in effects are GPU shaders and do not require software decoding. */
+    EffectDef *effect = active_effect(app);
+    if (effect)
+        add_effect_shader(argv, effect);
 
     if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_stretch))) {
         g_ptr_array_add(argv, g_strdup("--keepaspect=no"));
@@ -631,7 +961,7 @@ static void update_preview(App *app) {
         g_ptr_array_add(argv, g_strdup("--panscan=1.0"));
     }
 
-    g_ptr_array_add(argv, g_strdup(video));
+    g_ptr_array_add(argv, preview_media);
     g_ptr_array_add(argv, NULL);
 
     GError *err = NULL;
@@ -658,6 +988,7 @@ static void update_preview(App *app) {
     }
 
     g_ptr_array_free(argv, TRUE);
+    g_free(preview_static_cache);
     g_free(log_path);
     g_free(cache_dir);
     g_free(mpv);
@@ -723,6 +1054,10 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     g_clear_pointer(&app->applied_video, g_free);
     g_clear_pointer(&app->applied_stream, g_free);
     g_clear_pointer(&app->applied_source, g_free);
+    if (app->effects) {
+        g_ptr_array_free(app->effects, TRUE);
+        app->effects = NULL;
+    }
     gtk_main_quit();
 }
 
@@ -738,7 +1073,8 @@ static gboolean supported_wallpaper_file(const gchar *name) {
     gchar *lower = g_ascii_strdown(name, -1);
     const gchar *exts[] = {
         ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpg", ".mpeg",
-        ".gif", ".apng", NULL
+        ".gif", ".apng",
+        ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", NULL
     };
     gboolean ok = FALSE;
     for (int i = 0; exts[i]; i++) {
@@ -994,18 +1330,31 @@ static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpo
     }
 
     GtkWidget *dialog = gtk_file_chooser_dialog_new(
-        "Choose animated wallpaper", GTK_WINDOW(app->window), GTK_FILE_CHOOSER_ACTION_OPEN,
+        "Choose wallpaper media", GTK_WINDOW(app->window), GTK_FILE_CHOOSER_ACTION_OPEN,
         "Cancel", GTK_RESPONSE_CANCEL, "Open", GTK_RESPONSE_ACCEPT, NULL);
 
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Animated wallpaper files");
+    gtk_file_filter_set_name(filter, "Wallpaper media (video and images)");
     gtk_file_filter_add_mime_type(filter, "video/*");
-    gtk_file_filter_add_mime_type(filter, "image/gif");
-    gtk_file_filter_add_mime_type(filter, "image/apng");
+    gtk_file_filter_add_mime_type(filter, "image/*");
     gtk_file_filter_add_pattern(filter, "*.gif");
     gtk_file_filter_add_pattern(filter, "*.GIF");
     gtk_file_filter_add_pattern(filter, "*.apng");
     gtk_file_filter_add_pattern(filter, "*.APNG");
+    gtk_file_filter_add_pattern(filter, "*.png");
+    gtk_file_filter_add_pattern(filter, "*.PNG");
+    gtk_file_filter_add_pattern(filter, "*.jpg");
+    gtk_file_filter_add_pattern(filter, "*.JPG");
+    gtk_file_filter_add_pattern(filter, "*.jpeg");
+    gtk_file_filter_add_pattern(filter, "*.JPEG");
+    gtk_file_filter_add_pattern(filter, "*.webp");
+    gtk_file_filter_add_pattern(filter, "*.WEBP");
+    gtk_file_filter_add_pattern(filter, "*.bmp");
+    gtk_file_filter_add_pattern(filter, "*.BMP");
+    gtk_file_filter_add_pattern(filter, "*.tif");
+    gtk_file_filter_add_pattern(filter, "*.TIF");
+    gtk_file_filter_add_pattern(filter, "*.tiff");
+    gtk_file_filter_add_pattern(filter, "*.TIFF");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
     gchar *current = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(app->file_button));
@@ -1045,6 +1394,18 @@ static void on_source_toggled(GtkToggleButton *button, gpointer data) {
     update_status(app);
     save_config(app);
     schedule_preview_restart(app);
+}
+
+
+static void zero_other_effects(App *app,EffectDef *active){
+    for(guint i=0;app->effects&&i<app->effects->len;i++){EffectDef *e=g_ptr_array_index(app->effects,i);if(e==active)continue;EffectParam *p=effect_activation_param(e);if(p&&gtk_range_get_value(GTK_RANGE(p->slider))>p->min+0.001)gtk_range_set_value(GTK_RANGE(p->slider),p->min);}
+}
+
+static void on_effect_changed(GtkRange *range,gpointer data){
+    App *app=data;if(app->loading||app->changing_effects)return;
+    EffectParam *p=NULL;EffectDef *e=effect_for_slider(app,GTK_WIDGET(range),&p);EffectParam *a=effect_activation_param(e);
+    if(e&&p==a&&gtk_range_get_value(range)>a->min+0.001){app->changing_effects=TRUE;zero_other_effects(app,e);app->changing_effects=FALSE;}
+    on_setting_changed(GTK_WIDGET(range),app);
 }
 
 static void on_setting_changed(GtkWidget *widget, gpointer data) {
@@ -1191,8 +1552,6 @@ static void load_config(App *app) {
     gdouble brightness = loaded ? g_key_file_get_double(kf, "advanced", "brightness", NULL) : 0.0;
     gdouble contrast = loaded ? g_key_file_get_double(kf, "advanced", "contrast", NULL) : 0.0;
     gdouble saturation = loaded ? g_key_file_get_double(kf, "advanced", "saturation", NULL) : 0.0;
-    gdouble blur = loaded ? g_key_file_get_double(kf, "advanced", "blur", NULL) : 0.0;
-
     if (video && *video)
         gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(app->file_button), video);
     if (stream_url && *stream_url)
@@ -1214,7 +1573,21 @@ static void load_config(App *app) {
     gtk_range_set_value(GTK_RANGE(app->brightness_scale), brightness);
     gtk_range_set_value(GTK_RANGE(app->contrast_scale), contrast);
     gtk_range_set_value(GTK_RANGE(app->saturation_scale), saturation);
-    gtk_range_set_value(GTK_RANGE(app->blur_scale), blur);
+    gboolean found_effect=FALSE;
+    app->changing_effects=TRUE;
+    for(guint i=0;app->effects&&i<app->effects->len;i++){
+        EffectDef *e=g_ptr_array_index(app->effects,i);EffectParam *a=effect_activation_param(e);
+        gchar *group=g_strdup_printf("effect.%s",e->id);
+        for(guint j=0;j<e->params->len;j++){
+            EffectParam *p=g_ptr_array_index(e->params,j);gdouble v=p->default_value;
+            if(loaded&&g_key_file_has_key(kf,group,p->id,NULL))v=g_key_file_get_double(kf,group,p->id,NULL);
+            else if(p==a&&loaded&&g_key_file_has_key(kf,"effects",e->id,NULL))v=g_key_file_get_double(kf,"effects",e->id,NULL);
+            v=CLAMP(v,p->min,p->max);
+            if(p==a&&v>p->min+0.001){if(found_effect)v=p->min;else found_effect=TRUE;}
+            gtk_range_set_value(GTK_RANGE(p->slider),v);
+        }g_free(group);
+    }
+    app->changing_effects=FALSE;
 
     if (g_strcmp0(mode, "fit") == 0)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mode_fit), TRUE);
@@ -1377,27 +1750,40 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(source_box), app.source_stream, TRUE, TRUE, 0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.source_local), TRUE);
     gtk_box_pack_start(GTK_BOX(general),
-                       row("Wallpaper Source", "Choose a local animated file or a web video source.",
+                       row("Wallpaper Source", "Choose a local video, animated image, static image, or a web video source.",
                            source_box),
                        FALSE, FALSE, 0);
 
-    app.file_button = gtk_file_chooser_button_new("Choose animated wallpaper", GTK_FILE_CHOOSER_ACTION_OPEN);
+    app.file_button = gtk_file_chooser_button_new("Choose wallpaper media", GTK_FILE_CHOOSER_ACTION_OPEN);
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Animated wallpaper files");
+    gtk_file_filter_set_name(filter, "Wallpaper media (video and images)");
     gtk_file_filter_add_mime_type(filter, "video/*");
-    gtk_file_filter_add_mime_type(filter, "image/gif");
-    gtk_file_filter_add_mime_type(filter, "image/apng");
+    gtk_file_filter_add_mime_type(filter, "image/*");
     gtk_file_filter_add_pattern(filter, "*.gif");
     gtk_file_filter_add_pattern(filter, "*.GIF");
     gtk_file_filter_add_pattern(filter, "*.apng");
     gtk_file_filter_add_pattern(filter, "*.APNG");
+    gtk_file_filter_add_pattern(filter, "*.png");
+    gtk_file_filter_add_pattern(filter, "*.PNG");
+    gtk_file_filter_add_pattern(filter, "*.jpg");
+    gtk_file_filter_add_pattern(filter, "*.JPG");
+    gtk_file_filter_add_pattern(filter, "*.jpeg");
+    gtk_file_filter_add_pattern(filter, "*.JPEG");
+    gtk_file_filter_add_pattern(filter, "*.webp");
+    gtk_file_filter_add_pattern(filter, "*.WEBP");
+    gtk_file_filter_add_pattern(filter, "*.bmp");
+    gtk_file_filter_add_pattern(filter, "*.BMP");
+    gtk_file_filter_add_pattern(filter, "*.tif");
+    gtk_file_filter_add_pattern(filter, "*.TIF");
+    gtk_file_filter_add_pattern(filter, "*.tiff");
+    gtk_file_filter_add_pattern(filter, "*.TIFF");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(app.file_button), filter);
     GtkWidget *picker_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_size_request(picker_box, 270, -1);
     gtk_widget_set_size_request(app.file_button, -1, 30);
     gtk_box_pack_start(GTK_BOX(picker_box), app.file_button, TRUE, TRUE, 0);
     GtkWidget *gallery_button = gtk_button_new_with_label("Gallery...");
-    gtk_widget_set_tooltip_text(gallery_button, "Browse a folder as a grid of animated wallpaper thumbnails");
+    gtk_widget_set_tooltip_text(gallery_button, "Browse a folder as a grid of wallpaper thumbnails");
     gtk_widget_set_size_request(gallery_button, -1, 30);
     gtk_box_pack_start(GTK_BOX(picker_box), gallery_button, FALSE, FALSE, 0);
     app.wallpaper_row = row("Wallpaper file",
@@ -1475,7 +1861,7 @@ int main(int argc, char **argv) {
     centered_check_group_add(advanced_checks, app.interpolation_check);
 
     app.hwdec_check = gtk_check_button_new_with_label("Use hardware video decoding when available");
-    gtk_widget_set_tooltip_text(app.hwdec_check, "Lets mpv use hardware video decoding when possible. Blur may require software decoding.");
+    gtk_widget_set_tooltip_text(app.hwdec_check, "Lets mpv use hardware video decoding when possible. Built-in effects run in the GPU renderer.");
     centered_check_group_add(advanced_checks, app.hwdec_check);
 
     app.pause_fullscreen_check = gtk_check_button_new_with_label("Pause when another application is fullscreen");
@@ -1507,11 +1893,65 @@ int main(int argc, char **argv) {
     gtk_scale_set_value_pos(GTK_SCALE(app.saturation_scale), GTK_POS_RIGHT);
     gtk_box_pack_start(GTK_BOX(advanced), row("Saturation", "Reduce color intensity for a calmer wallpaper, or increase it for stronger colors.", app.saturation_scale), FALSE, FALSE, 0);
 
-    app.blur_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 20, 0.5);
-    gtk_widget_set_size_request(app.blur_scale, 260, -1);
-    gtk_scale_set_digits(GTK_SCALE(app.blur_scale), 1);
-    gtk_scale_set_value_pos(GTK_SCALE(app.blur_scale), GTK_POS_RIGHT);
-    gtk_box_pack_start(GTK_BOX(advanced), row("Blur", "Apply Gaussian blur. Higher values cost more GPU time.", app.blur_scale), FALSE, FALSE, 0);
+
+    GtkWidget *effects_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(effects_scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    GtkWidget *effects = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(effects), 10);
+    gtk_container_add(GTK_CONTAINER(effects_scroll), effects);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), effects_scroll, gtk_label_new("Effects"));
+
+    GtkWidget *effects_intro = gtk_label_new(
+        "GPU effects are applied by mpv shaders. For stability, only one effect can be active at a time.");
+    gtk_label_set_xalign(GTK_LABEL(effects_intro), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(effects_intro), TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(effects_intro), "dim-label");
+    gtk_widget_set_margin_top(effects_intro, 10);
+    gtk_widget_set_margin_bottom(effects_intro, 10);
+    gtk_box_pack_start(GTK_BOX(effects), effects_intro, FALSE, FALSE, 0);
+
+    app.effects=discover_effects();
+    if(!app.effects||!app.effects->len){
+        GtkWidget *none=gtk_label_new("No effects were found.");gtk_box_pack_start(GTK_BOX(effects),none,FALSE,FALSE,0);
+    }else{
+        for(guint i=0;i<app.effects->len;i++){
+            EffectDef *e=g_ptr_array_index(app.effects,i);EffectParam *a=effect_activation_param(e);if(!a)continue;
+            a->slider=gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,a->min,a->max,a->step);
+            gtk_widget_set_size_request(a->slider,260,-1);gtk_scale_set_digits(GTK_SCALE(a->slider),a->digits);gtk_scale_set_value_pos(GTK_SCALE(a->slider),GTK_POS_RIGHT);gtk_range_set_value(GTK_RANGE(a->slider),a->default_value);
+            gtk_box_pack_start(GTK_BOX(effects),row(e->name,e->description,a->slider),FALSE,FALSE,0);
+            g_signal_connect(a->slider,"value-changed",G_CALLBACK(on_effect_changed),&app);
+            if (e->params->len > 1) {
+                GtkWidget *expander = gtk_expander_new("Parameters");
+                gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
+                gtk_widget_set_margin_start(expander, 28);
+                gtk_widget_set_margin_end(expander, 4);
+                gtk_box_pack_start(GTK_BOX(effects), expander, FALSE, FALSE, 0);
+
+                GtkWidget *param_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+                gtk_widget_set_margin_top(param_box, 6);
+                gtk_widget_set_margin_start(param_box, 12);
+                gtk_container_add(GTK_CONTAINER(expander), param_box);
+
+                for(guint j=0;j<e->params->len;j++){
+                    EffectParam *p=g_ptr_array_index(e->params,j);
+                    if(p==a)continue;
+
+                    p->slider=gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,p->min,p->max,p->step);
+                    gtk_widget_set_size_request(p->slider,260,-1);
+                    gtk_scale_set_digits(GTK_SCALE(p->slider),p->digits);
+                    gtk_scale_set_value_pos(GTK_SCALE(p->slider),GTK_POS_RIGHT);
+                    gtk_range_set_value(GTK_RANGE(p->slider),p->default_value);
+
+                    GtkWidget *pr=row(p->name,"",p->slider);
+                    gtk_box_pack_start(GTK_BOX(param_box),pr,FALSE,FALSE,0);
+
+                    g_signal_connect(p->slider,"value-changed",
+                                     G_CALLBACK(on_effect_changed),&app);
+                }
+            }
+        }
+    }
 
     GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(root), sep, FALSE, FALSE, 2);
@@ -1570,7 +2010,6 @@ int main(int argc, char **argv) {
     g_signal_connect(app.brightness_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.contrast_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.saturation_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
-    g_signal_connect(app.blur_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(reset_defaults_button, "clicked", G_CALLBACK(on_reset_clicked), &app);
     g_signal_connect(set_wallpaper, "clicked", G_CALLBACK(on_set_clicked), &app);
     g_signal_connect(app.turn_off_button, "clicked", G_CALLBACK(on_turn_off_clicked), &app);
