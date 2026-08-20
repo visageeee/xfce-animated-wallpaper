@@ -1,3 +1,4 @@
+- Add optional desktop icon overlay for items in the XDG Desktop folder.
 - Add Wave Distortion, Dream Diffusion, and Bloom GPU effects.
 - Fix Film Grain shader color corruption and make Scanlines visibly render on mpv GPU output.
 - Bake effect strengths into generated GLSL files instead of relying on mpv runtime shader parameters.

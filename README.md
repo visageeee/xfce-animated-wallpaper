@@ -6,11 +6,11 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 
 > **Version:** 0.3.0  
 > **Status:** early release. X11 only.
-> 
-![animatedẃallpaperdemo](demo.webp)
+
 ## Features
 
 - Native GTK3 settings app integrated with Xfce Settings Manager
+- Optional lightweight desktop icon layer showing items from the XDG Desktop folder above the wallpaper
 - Video, GIF, APNG and static image wallpaper support
 - Web URL sources, including direct network streams and experimental web-video support through `yt-dlp`
 - Clickable wallpaper preview
@@ -96,6 +96,15 @@ Changing controls only updates the saved configuration. The currently running wa
 Press **Turn Off** to stop the animated wallpaper and return to the desktop background configured by Xfce.
 
 If **Start when you log in** is enabled, the wallpaper is restored on login only if it was left active. Turning it off keeps it off at the next login.
+
+
+## Desktop icons
+
+Animated wallpapers created with `xwinwrap` can cover Xfce's normal desktop icons. The optional **Show desktop icons above wallpaper** setting starts a lightweight companion process, `xfce-animated-wallpaper-icons`, which displays items from the user's XDG Desktop directory above the wallpaper while remaining below normal application windows.
+
+The icon layer uses the system icon theme, opens files and folders with their normal applications, launches `.desktop` files, watches the Desktop folder for changes, and stops automatically when the animated wallpaper is turned off.
+
+This is intentionally a small replacement layer rather than a full reimplementation of xfdesktop's desktop management.
 
 ## Backend commands
 

@@ -143,6 +143,37 @@ static gchar *pid_path(void) {
                             "xfce-animated-wallpaper.pid", NULL);
 }
 
+static gchar *icons_pid_path(void) {
+    return g_build_filename(g_get_user_runtime_dir() ? g_get_user_runtime_dir() : "/tmp",
+                            "xfce-animated-wallpaper-icons.pid", NULL);
+}
+
+static GPid read_icons_pid(void) {
+    gchar *path = icons_pid_path();
+    gchar *contents = NULL;
+    GPid pid = 0;
+    if (g_file_get_contents(path, &contents, NULL, NULL) && contents)
+        pid = (GPid)g_ascii_strtoll(contents, NULL, 10);
+    g_free(contents);
+    g_free(path);
+    return pid;
+}
+
+static void remove_icons_pidfile(void) {
+    gchar *path = icons_pid_path();
+    g_unlink(path);
+    g_free(path);
+}
+
+static gboolean write_icons_pid(GPid pid, GError **error) {
+    gchar *path = icons_pid_path();
+    gchar *text = g_strdup_printf("%d\n", (int)pid);
+    gboolean ok = g_file_set_contents(path, text, -1, error);
+    g_free(text);
+    g_free(path);
+    return ok;
+}
+
 static gchar *wallpaper_log_path(void) {
     gchar *dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
     g_mkdir_with_parents(dir, 0700);
@@ -159,6 +190,59 @@ static gboolean process_alive(GPid pid) {
 static void child_setup(gpointer data) {
     (void)data;
     setpgid(0, 0);
+}
+
+static gboolean stop_desktop_icons(void) {
+    GPid pid = read_icons_pid();
+    if (pid <= 1 || kill(-pid, 0) != 0) {
+        remove_icons_pidfile();
+        return TRUE;
+    }
+
+    kill(-pid, SIGTERM);
+    for (int i = 0; i < 10; i++) {
+        g_usleep(50000);
+        if (kill(-pid, 0) != 0) {
+            remove_icons_pidfile();
+            return TRUE;
+        }
+    }
+
+    kill(-pid, SIGKILL);
+    g_usleep(50000);
+    remove_icons_pidfile();
+    return kill(-pid, 0) != 0;
+}
+
+static gboolean start_desktop_icons(void) {
+    stop_desktop_icons();
+
+    gchar *argv[] = { (gchar *)"xfce-animated-wallpaper-icons", NULL };
+    GPid pid = 0;
+    GError *error = NULL;
+
+    gboolean ok = g_spawn_async(
+        NULL, argv, NULL,
+        G_SPAWN_SEARCH_PATH |
+        G_SPAWN_DO_NOT_REAP_CHILD |
+        G_SPAWN_STDOUT_TO_DEV_NULL |
+        G_SPAWN_STDERR_TO_DEV_NULL,
+        child_setup, NULL, &pid, &error);
+
+    if (!ok) {
+        g_printerr("Could not start desktop icon layer: %s\n",
+                   error ? error->message : "unknown error");
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    if (!write_icons_pid(pid, &error)) {
+        g_printerr("Desktop icons started, but PID file could not be written: %s\n",
+                   error ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
+
+    return TRUE;
 }
 
 static GPid read_pid(void) {
@@ -180,6 +264,8 @@ static void remove_pidfile(void) {
 }
 
 static gboolean stop_wallpaper(void) {
+    stop_desktop_icons();
+
     GPid pid = read_pid();
     if (!process_alive(pid)) {
         remove_pidfile();
@@ -357,6 +443,7 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     gboolean interpolation = get_bool(kf, "advanced", "interpolation", FALSE);
     gboolean pause_fullscreen = get_bool(kf, "advanced", "pause_fullscreen", TRUE);
     gboolean pause_battery = get_bool(kf, "advanced", "pause_battery", FALSE);
+    gboolean desktop_icons = get_bool(kf, "desktop", "show_icons", FALSE);
     gdouble brightness = get_double(kf, "advanced", "brightness", 0.0);
     gdouble contrast = get_double(kf, "advanced", "contrast", 0.0);
     gdouble saturation = get_double(kf, "advanced", "saturation", 0.0);
@@ -528,6 +615,9 @@ static gboolean start_wallpaper(gboolean require_enabled) {
         g_printerr("Wallpaper started, but PID file could not be written: %s\n", err->message);
         g_clear_error(&err);
     }
+
+    if (ok && desktop_icons)
+        start_desktop_icons();
 
     g_ptr_array_free(argv, TRUE);
     if (effects)

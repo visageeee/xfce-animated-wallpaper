@@ -42,6 +42,7 @@ typedef struct {
     GtkWidget *hwdec_check;
     GtkWidget *fps_spin;
     GtkWidget *autostart_check;
+    GtkWidget *desktop_icons_check;
     GtkWidget *interpolation_check;
     GtkWidget *pause_fullscreen_check;
     GtkWidget *pause_battery_check;
@@ -467,6 +468,7 @@ static void save_config(App *app) {
     g_key_file_set_boolean(kf, "playback", "mute", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mute_check)));
     g_key_file_set_boolean(kf, "playback", "loop", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->loop_check)));
     g_key_file_set_boolean(kf, "playback", "hwdec", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->hwdec_check)));
+    g_key_file_set_boolean(kf, "desktop", "show_icons", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->desktop_icons_check)));
     g_key_file_set_integer(kf, "playback", "fps_limit", gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->fps_spin)));
     g_key_file_set_boolean(kf, "advanced", "interpolation", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->interpolation_check)));
     g_key_file_set_boolean(kf, "advanced", "pause_fullscreen", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->pause_fullscreen_check)));
@@ -508,6 +510,7 @@ static void reset_defaults(App *app) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mute_check), TRUE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->loop_check), TRUE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hwdec_check), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->desktop_icons_check), FALSE);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), 0);
 
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->interpolation_check), FALSE);
@@ -1544,6 +1547,7 @@ static void load_config(App *app) {
     gboolean mute = loaded ? g_key_file_get_boolean(kf, "playback", "mute", NULL) : TRUE;
     gboolean loop = loaded ? g_key_file_get_boolean(kf, "playback", "loop", NULL) : TRUE;
     gboolean hwdec = loaded ? g_key_file_get_boolean(kf, "playback", "hwdec", NULL) : TRUE;
+    gboolean desktop_icons = loaded && g_key_file_has_key(kf, "desktop", "show_icons", NULL) ? g_key_file_get_boolean(kf, "desktop", "show_icons", NULL) : FALSE;
     gint fps = loaded ? g_key_file_get_integer(kf, "playback", "fps_limit", NULL) : 0;
     gboolean interpolation = loaded ? g_key_file_get_boolean(kf, "advanced", "interpolation", NULL) : FALSE;
     gboolean pause_fullscreen = loaded && g_key_file_has_key(kf, "advanced", "pause_fullscreen", NULL) ? g_key_file_get_boolean(kf, "advanced", "pause_fullscreen", NULL) : TRUE;
@@ -1565,6 +1569,7 @@ static void load_config(App *app) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mute_check), mute);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->loop_check), loop);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hwdec_check), hwdec);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->desktop_icons_check), desktop_icons);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), fps);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->interpolation_check), interpolation);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->pause_fullscreen_check), pause_fullscreen);
@@ -1845,6 +1850,10 @@ int main(int argc, char **argv) {
     centered_check_group_add(general_checks, app.reconnect_check);
     app.autostart_check = gtk_check_button_new_with_label("Start when you log in");
     centered_check_group_add(general_checks, app.autostart_check);
+    app.desktop_icons_check = gtk_check_button_new_with_label("Show desktop icons above wallpaper");
+    gtk_widget_set_tooltip_text(app.desktop_icons_check,
+                                "Shows items from your XDG Desktop folder in a lightweight icon layer above the animated wallpaper.");
+    centered_check_group_add(general_checks, app.desktop_icons_check);
     gtk_box_pack_start(GTK_BOX(general), general_checks, FALSE, FALSE, 0);
 
     GtkWidget *advanced_scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -2003,6 +2012,7 @@ int main(int argc, char **argv) {
     g_signal_connect(app.hwdec_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.fps_spin, "value-changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.autostart_check, "toggled", G_CALLBACK(on_autostart_toggled), &app);
+    g_signal_connect(app.desktop_icons_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.interpolation_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.pause_fullscreen_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.pause_battery_check, "toggled", G_CALLBACK(on_setting_changed), &app);
