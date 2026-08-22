@@ -15,7 +15,7 @@ typedef struct {
 } EffectParam;
 
 typedef struct {
-    gchar *id, *name, *description, *shader_path;
+    gchar *id, *name, *description, *shader_path, *icon_path;
     gint order;
     GPtrArray *params;
 } EffectDef;
@@ -43,6 +43,13 @@ typedef struct {
     GtkWidget *fps_spin;
     GtkWidget *autostart_check;
     GtkWidget *desktop_icons_check;
+    GtkWidget *audio_enabled_check;
+    GtkWidget *audio_waveform_check;
+    GtkWidget *audio_effect_label;
+    GtkWidget *audio_parameter_combo;
+    GtkWidget *audio_source_combo;
+    GtkWidget *audio_sensitivity_scale;
+    GtkWidget *audio_smoothing_scale;
     GtkWidget *interpolation_check;
     GtkWidget *pause_fullscreen_check;
     GtkWidget *pause_battery_check;
@@ -193,14 +200,16 @@ static void effect_param_free(gpointer data) {
 static void effect_def_free(gpointer data) {
     EffectDef *e = data;
     if (!e) return;
-    g_free(e->id); g_free(e->name); g_free(e->description); g_free(e->shader_path);
+    g_free(e->id); g_free(e->name); g_free(e->description);
+    g_free(e->shader_path); g_free(e->icon_path);
     if (e->params) g_ptr_array_free(e->params, TRUE);
     g_free(e);
 }
 static gint effect_sort(gconstpointer a, gconstpointer b) {
-    const EffectDef *ea = *(EffectDef * const *)a, *eb = *(EffectDef * const *)b;
-    if (ea->order != eb->order) return ea->order - eb->order;
-    return g_strcmp0(ea->name, eb->name);
+    const EffectDef *ea = *(EffectDef * const *)a;
+    const EffectDef *eb = *(EffectDef * const *)b;
+    return g_utf8_collate(ea->name ? ea->name : "",
+                          eb->name ? eb->name : "");
 }
 static gint effect_param_sort(gconstpointer a, gconstpointer b) {
     const EffectParam *pa = *(EffectParam * const *)a, *pb = *(EffectParam * const *)b;
@@ -280,19 +289,31 @@ static void load_effect_dir(GPtrArray *effects,const gchar *base) {
         gchar *name=g_key_file_get_string(kf,"Effect","name",NULL);
         gchar *desc=g_key_file_get_string(kf,"Effect","description",NULL);
         gchar *shader_name=g_key_file_get_string(kf,"Effect","shader",NULL);
+        gchar *icon_name=g_key_file_has_key(kf,"Effect","icon",NULL)
+                           ? g_key_file_get_string(kf,"Effect","icon",NULL)
+                           : NULL;
         if(!id||!*id||!name||!*name||!shader_name||!*shader_name||effect_id_loaded(effects,id)){
-            g_free(id);g_free(name);g_free(desc);g_free(shader_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;
+            g_free(id);g_free(name);g_free(desc);g_free(shader_name);g_free(icon_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;
         }
         gchar *shader=g_build_filename(folder,shader_name,NULL);
         if(!g_file_test(shader,G_FILE_TEST_IS_REGULAR)){
-            g_free(shader);g_free(id);g_free(name);g_free(desc);g_free(shader_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;
+            g_free(shader);g_free(id);g_free(name);g_free(desc);g_free(shader_name);g_free(icon_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;
         }
         EffectDef *e=g_new0(EffectDef,1);
         e->id=id;e->name=name;e->description=desc?desc:g_strdup("");e->shader_path=shader;
+
+        if (icon_name && *icon_name) {
+            gchar *candidate = g_build_filename(folder, icon_name, NULL);
+            if (g_file_test(candidate, G_FILE_TEST_IS_REGULAR))
+                e->icon_path = candidate;
+            else
+                g_free(candidate);
+        }
+
         e->order=g_key_file_has_key(kf,"Effect","order",NULL)?g_key_file_get_integer(kf,"Effect","order",NULL):1000;
         e->params=g_ptr_array_new_with_free_func(effect_param_free);
         load_effect_parameters(kf,e); g_ptr_array_add(effects,e);
-        g_free(shader_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);
+        g_free(icon_name);g_free(shader_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);
     }
     g_dir_close(dir);
 }
@@ -469,6 +490,19 @@ static void save_config(App *app) {
     g_key_file_set_boolean(kf, "playback", "loop", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->loop_check)));
     g_key_file_set_boolean(kf, "playback", "hwdec", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->hwdec_check)));
     g_key_file_set_boolean(kf, "desktop", "show_icons", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->desktop_icons_check)));
+    g_key_file_set_boolean(kf, "audio", "enabled", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->audio_enabled_check)));
+    g_key_file_set_boolean(kf, "audio", "show_waveform", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->audio_waveform_check)));
+    const gchar *audio_param = gtk_combo_box_get_active_id(GTK_COMBO_BOX(app->audio_parameter_combo));
+    g_key_file_set_string(kf, "audio", "parameter", audio_param ? audio_param : "strength");
+    gchar *audio_source_text =
+        gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(app->audio_source_combo));
+    g_key_file_set_string(kf, "audio", "source",
+                          audio_source_text &&
+                          g_strcmp0(audio_source_text, "Overall level") == 0
+                              ? "overall" : "bass");
+    g_free(audio_source_text);
+    g_key_file_set_double(kf, "audio", "sensitivity", gtk_range_get_value(GTK_RANGE(app->audio_sensitivity_scale)));
+    g_key_file_set_double(kf, "audio", "smoothing", gtk_range_get_value(GTK_RANGE(app->audio_smoothing_scale)));
     g_key_file_set_integer(kf, "playback", "fps_limit", gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->fps_spin)));
     g_key_file_set_boolean(kf, "advanced", "interpolation", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->interpolation_check)));
     g_key_file_set_boolean(kf, "advanced", "pause_fullscreen", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->pause_fullscreen_check)));
@@ -511,6 +545,11 @@ static void reset_defaults(App *app) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->loop_check), TRUE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hwdec_check), TRUE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->desktop_icons_check), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_enabled_check), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_waveform_check), FALSE);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_source_combo), 0);
+    gtk_range_set_value(GTK_RANGE(app->audio_sensitivity_scale), 2.0);
+    gtk_range_set_value(GTK_RANGE(app->audio_smoothing_scale), 0.82);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), 0);
 
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->interpolation_check), FALSE);
@@ -1399,6 +1438,43 @@ static void on_source_toggled(GtkToggleButton *button, gpointer data) {
 }
 
 
+static void refresh_audio_effect_controls(App *app) {
+    if (!app->audio_effect_label || !app->audio_parameter_combo)
+        return;
+
+    gchar *previous = NULL;
+    const gchar *active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(app->audio_parameter_combo));
+    if (active_id) previous = g_strdup(active_id);
+
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(app->audio_parameter_combo));
+    EffectDef *effect = active_effect(app);
+
+    if (!effect) {
+        gtk_label_set_text(GTK_LABEL(app->audio_effect_label), "Active effect: None");
+        gtk_widget_set_sensitive(app->audio_parameter_combo, FALSE);
+        g_free(previous);
+        return;
+    }
+
+    gchar *label = g_strdup_printf("Active effect: %s", effect->name);
+    gtk_label_set_text(GTK_LABEL(app->audio_effect_label), label);
+    g_free(label);
+    gtk_widget_set_sensitive(app->audio_parameter_combo, TRUE);
+
+    for (guint i = 0; i < effect->params->len; i++) {
+        EffectParam *p = g_ptr_array_index(effect->params, i);
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->audio_parameter_combo),
+                                  p->id, p->name);
+    }
+
+    if (previous && gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->audio_parameter_combo), previous)) {
+        /* preserved */
+    } else if (!gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->audio_parameter_combo), "strength")) {
+        gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_parameter_combo), 0);
+    }
+    g_free(previous);
+}
+
 static void zero_other_effects(App *app,EffectDef *active){
     for(guint i=0;app->effects&&i<app->effects->len;i++){EffectDef *e=g_ptr_array_index(app->effects,i);if(e==active)continue;EffectParam *p=effect_activation_param(e);if(p&&gtk_range_get_value(GTK_RANGE(p->slider))>p->min+0.001)gtk_range_set_value(GTK_RANGE(p->slider),p->min);}
 }
@@ -1407,6 +1483,7 @@ static void on_effect_changed(GtkRange *range,gpointer data){
     App *app=data;if(app->loading||app->changing_effects)return;
     EffectParam *p=NULL;EffectDef *e=effect_for_slider(app,GTK_WIDGET(range),&p);EffectParam *a=effect_activation_param(e);
     if(e&&p==a&&gtk_range_get_value(range)>a->min+0.001){app->changing_effects=TRUE;zero_other_effects(app,e);app->changing_effects=FALSE;}
+    refresh_audio_effect_controls(app);
     on_setting_changed(GTK_WIDGET(range),app);
 }
 
@@ -1548,6 +1625,12 @@ static void load_config(App *app) {
     gboolean loop = loaded ? g_key_file_get_boolean(kf, "playback", "loop", NULL) : TRUE;
     gboolean hwdec = loaded ? g_key_file_get_boolean(kf, "playback", "hwdec", NULL) : TRUE;
     gboolean desktop_icons = loaded && g_key_file_has_key(kf, "desktop", "show_icons", NULL) ? g_key_file_get_boolean(kf, "desktop", "show_icons", NULL) : FALSE;
+    gboolean audio_enabled = loaded && g_key_file_has_key(kf, "audio", "enabled", NULL) ? g_key_file_get_boolean(kf, "audio", "enabled", NULL) : FALSE;
+    gboolean audio_waveform = loaded && g_key_file_has_key(kf, "audio", "show_waveform", NULL) ? g_key_file_get_boolean(kf, "audio", "show_waveform", NULL) : FALSE;
+    gchar *audio_source = loaded && g_key_file_has_key(kf, "audio", "source", NULL) ? g_key_file_get_string(kf, "audio", "source", NULL) : g_strdup("bass");
+    gchar *audio_parameter = loaded && g_key_file_has_key(kf, "audio", "parameter", NULL) ? g_key_file_get_string(kf, "audio", "parameter", NULL) : g_strdup("strength");
+    gdouble audio_sensitivity = loaded && g_key_file_has_key(kf, "audio", "sensitivity", NULL) ? g_key_file_get_double(kf, "audio", "sensitivity", NULL) : 2.0;
+    gdouble audio_smoothing = loaded && g_key_file_has_key(kf, "audio", "smoothing", NULL) ? g_key_file_get_double(kf, "audio", "smoothing", NULL) : 0.82;
     gint fps = loaded ? g_key_file_get_integer(kf, "playback", "fps_limit", NULL) : 0;
     gboolean interpolation = loaded ? g_key_file_get_boolean(kf, "advanced", "interpolation", NULL) : FALSE;
     gboolean pause_fullscreen = loaded && g_key_file_has_key(kf, "advanced", "pause_fullscreen", NULL) ? g_key_file_get_boolean(kf, "advanced", "pause_fullscreen", NULL) : TRUE;
@@ -1570,6 +1653,12 @@ static void load_config(App *app) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->loop_check), loop);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hwdec_check), hwdec);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->desktop_icons_check), desktop_icons);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_enabled_check), audio_enabled);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_waveform_check), audio_waveform);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_source_combo),
+                             g_strcmp0(audio_source, "overall") == 0 ? 1 : 0);
+    gtk_range_set_value(GTK_RANGE(app->audio_sensitivity_scale), CLAMP(audio_sensitivity, 0.1, 10.0));
+    gtk_range_set_value(GTK_RANGE(app->audio_smoothing_scale), CLAMP(audio_smoothing, 0.0, 0.98));
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), fps);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->interpolation_check), interpolation);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->pause_fullscreen_check), pause_fullscreen);
@@ -1592,6 +1681,11 @@ static void load_config(App *app) {
         }g_free(group);
     }
     app->changing_effects=FALSE;
+    refresh_audio_effect_controls(app);
+    if (audio_parameter && *audio_parameter)
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->audio_parameter_combo), audio_parameter);
+    g_free(audio_parameter);
+    g_free(audio_source);
 
     if (g_strcmp0(mode, "fit") == 0)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mode_fit), TRUE);
@@ -1640,6 +1734,42 @@ static GtkWidget *row(const gchar *title, const gchar *subtitle, GtkWidget *cont
     gtk_widget_set_margin_top(box, 10);
     gtk_widget_set_margin_bottom(box, 10);
     return box;
+}
+
+
+static GtkWidget *effect_row(EffectDef *effect, GtkWidget *control) {
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+
+    GtkWidget *image = NULL;
+    if (effect->icon_path) {
+        GError *error = NULL;
+        GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale(
+            effect->icon_path, 42, 42, TRUE, &error);
+        if (pixbuf) {
+            image = gtk_image_new_from_pixbuf(pixbuf);
+            g_object_unref(pixbuf);
+        }
+        g_clear_error(&error);
+    }
+
+    if (!image) {
+        image = gtk_image_new_from_icon_name("applications-graphics",
+                                             GTK_ICON_SIZE_DIALOG);
+        gtk_image_set_pixel_size(GTK_IMAGE(image), 42);
+    }
+
+    gtk_widget_set_size_request(image, 46, 46);
+    gtk_widget_set_valign(image, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(outer), image, FALSE, FALSE, 0);
+
+    GtkWidget *content = row(effect->name, effect->description, control);
+    gtk_widget_set_margin_top(content, 0);
+    gtk_widget_set_margin_bottom(content, 0);
+    gtk_box_pack_start(GTK_BOX(outer), content, TRUE, TRUE, 0);
+
+    gtk_widget_set_margin_top(outer, 10);
+    gtk_widget_set_margin_bottom(outer, 10);
+    return outer;
 }
 
 static GtkWidget *centered_check_group(void) {
@@ -1848,12 +1978,13 @@ int main(int argc, char **argv) {
     app.reconnect_check = gtk_check_button_new_with_label("Reconnect web video if playback stops");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.reconnect_check), TRUE);
     centered_check_group_add(general_checks, app.reconnect_check);
+    app.desktop_icons_check = gtk_check_button_new_with_label("Show desktop icons");
+    gtk_widget_set_tooltip_text(app.desktop_icons_check,
+                                "Shows items from your XDG Desktop folder above the animated wallpaper.");
+    centered_check_group_add(general_checks, app.desktop_icons_check);
+
     app.autostart_check = gtk_check_button_new_with_label("Start when you log in");
     centered_check_group_add(general_checks, app.autostart_check);
-    app.desktop_icons_check = gtk_check_button_new_with_label("Show desktop icons above wallpaper");
-    gtk_widget_set_tooltip_text(app.desktop_icons_check,
-                                "Shows items from your XDG Desktop folder in a lightweight icon layer above the animated wallpaper.");
-    centered_check_group_add(general_checks, app.desktop_icons_check);
     gtk_box_pack_start(GTK_BOX(general), general_checks, FALSE, FALSE, 0);
 
     GtkWidget *advanced_scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -1927,12 +2058,12 @@ int main(int argc, char **argv) {
             EffectDef *e=g_ptr_array_index(app.effects,i);EffectParam *a=effect_activation_param(e);if(!a)continue;
             a->slider=gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,a->min,a->max,a->step);
             gtk_widget_set_size_request(a->slider,260,-1);gtk_scale_set_digits(GTK_SCALE(a->slider),a->digits);gtk_scale_set_value_pos(GTK_SCALE(a->slider),GTK_POS_RIGHT);gtk_range_set_value(GTK_RANGE(a->slider),a->default_value);
-            gtk_box_pack_start(GTK_BOX(effects),row(e->name,e->description,a->slider),FALSE,FALSE,0);
+            gtk_box_pack_start(GTK_BOX(effects),effect_row(e,a->slider),FALSE,FALSE,0);
             g_signal_connect(a->slider,"value-changed",G_CALLBACK(on_effect_changed),&app);
             if (e->params->len > 1) {
                 GtkWidget *expander = gtk_expander_new("Parameters");
                 gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
-                gtk_widget_set_margin_start(expander, 28);
+                gtk_widget_set_margin_start(expander, 58);
                 gtk_widget_set_margin_end(expander, 4);
                 gtk_box_pack_start(GTK_BOX(effects), expander, FALSE, FALSE, 0);
 
@@ -1960,6 +2091,68 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    GtkWidget *audio_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(audio_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    GtkWidget *audio = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(audio), 10);
+    gtk_container_add(GTK_CONTAINER(audio_scroll), audio);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), audio_scroll, gtk_label_new("Audio Visualizer"));
+
+    GtkWidget *audio_intro = gtk_label_new(
+        "Use the current system audio output to animate a parameter of the active GPU effect. "
+        "The selected effect parameter acts as the maximum value; silence moves it toward that parameter's minimum.");
+    gtk_label_set_xalign(GTK_LABEL(audio_intro), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(audio_intro), TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(audio_intro), "dim-label");
+    gtk_box_pack_start(GTK_BOX(audio), audio_intro, FALSE, FALSE, 4);
+
+    GtkWidget *audio_checks = centered_check_group();
+    app.audio_enabled_check = gtk_check_button_new_with_label("Enable audio-reactive effect");
+    centered_check_group_add(audio_checks, app.audio_enabled_check);
+    app.audio_waveform_check = gtk_check_button_new_with_label("Show waveform overlay");
+    centered_check_group_add(audio_checks, app.audio_waveform_check);
+    gtk_box_pack_start(GTK_BOX(audio), audio_checks, FALSE, FALSE, 0);
+
+    app.audio_effect_label = gtk_label_new("Active effect: None");
+    gtk_label_set_xalign(GTK_LABEL(app.audio_effect_label), 0.0);
+    gtk_widget_set_margin_top(app.audio_effect_label, 8);
+    gtk_box_pack_start(GTK_BOX(audio), app.audio_effect_label, FALSE, FALSE, 0);
+
+    app.audio_source_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.audio_source_combo), "Bass");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.audio_source_combo), "Overall level");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app.audio_source_combo), 0);
+    gtk_widget_set_size_request(app.audio_source_combo, 220, -1);
+    gtk_box_pack_start(GTK_BOX(audio), row("Audio source",
+        "Bass follows roughly 40–180 Hz and usually gives stronger rhythmic variation than overall volume.",
+        app.audio_source_combo), FALSE, FALSE, 0);
+
+    app.audio_parameter_combo = gtk_combo_box_text_new();
+    gtk_widget_set_size_request(app.audio_parameter_combo, 220, -1);
+    gtk_box_pack_start(GTK_BOX(audio), row("Controlled parameter",
+        "Parameters are taken automatically from the currently active effect.",
+        app.audio_parameter_combo), FALSE, FALSE, 0);
+
+    app.audio_sensitivity_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.1, 10.0, 0.1);
+    gtk_widget_set_size_request(app.audio_sensitivity_scale, 260, -1);
+    gtk_scale_set_digits(GTK_SCALE(app.audio_sensitivity_scale), 1);
+    gtk_scale_set_value_pos(GTK_SCALE(app.audio_sensitivity_scale), GTK_POS_RIGHT);
+    gtk_range_set_value(GTK_RANGE(app.audio_sensitivity_scale), 2.0);
+    gtk_box_pack_start(GTK_BOX(audio), row("Sensitivity",
+        "How strongly the selected audio signal drives the selected parameter.",
+        app.audio_sensitivity_scale), FALSE, FALSE, 0);
+
+    app.audio_smoothing_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 0.98, 0.01);
+    gtk_widget_set_size_request(app.audio_smoothing_scale, 260, -1);
+    gtk_scale_set_digits(GTK_SCALE(app.audio_smoothing_scale), 2);
+    gtk_scale_set_value_pos(GTK_SCALE(app.audio_smoothing_scale), GTK_POS_RIGHT);
+    gtk_range_set_value(GTK_RANGE(app.audio_smoothing_scale), 0.82);
+    gtk_box_pack_start(GTK_BOX(audio), row("Smoothing",
+        "Higher values produce slower, softer movement; lower values react more sharply to beats.",
+        app.audio_smoothing_scale), FALSE, FALSE, 0);
+
+    refresh_audio_effect_controls(&app);
 
     GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(root), sep, FALSE, FALSE, 2);
@@ -2013,6 +2206,12 @@ int main(int argc, char **argv) {
     g_signal_connect(app.fps_spin, "value-changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.autostart_check, "toggled", G_CALLBACK(on_autostart_toggled), &app);
     g_signal_connect(app.desktop_icons_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.audio_enabled_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.audio_waveform_check, "toggled", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.audio_source_combo, "changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.audio_parameter_combo, "changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.audio_sensitivity_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.audio_smoothing_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.interpolation_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.pause_fullscreen_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.pause_battery_check, "toggled", G_CALLBACK(on_setting_changed), &app);

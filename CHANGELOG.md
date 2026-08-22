@@ -1,3 +1,4 @@
+- Add Audio Visualizer tab with live output-level control of active effect parameters.
 - Add optional desktop icon overlay for items in the XDG Desktop folder.
 - Add Wave Distortion, Dream Diffusion, and Bloom GPU effects.
 - Fix Film Grain shader color corruption and make Scanlines visibly render on mpv GPU output.

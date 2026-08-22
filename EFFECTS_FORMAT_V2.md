@@ -10,6 +10,8 @@ id=water_ripple
 name=Water ripple
 description=Animated water refraction.
 shader=shader.glsl
+# Optional image bundled with the effect directory:
+icon=icon.png
 order=96
 
 [Parameter strength]
@@ -59,3 +61,15 @@ Secondary parameters are shown inside a collapsed **Parameters** expander beneat
 - Wave distortion: Strength, Speed, Wave density
 - Dream diffusion: Strength, Radius, Glow
 - Bloom: Strength, Threshold, Radius
+
+## Effect icons
+
+An effect may include an icon file in its module directory and reference it from `[Effect]`:
+
+```ini
+icon=icon.png
+```
+
+PNG, SVG and other image formats supported by GdkPixbuf can be used. If the key is absent, the file cannot be loaded, or the file does not exist, the settings UI shows the default graphics/effect icon.
+
+Effects are displayed alphabetically by their `name`; the manifest `order` value no longer controls effect-list ordering. Parameter `order` values still control the order of sub-parameters.

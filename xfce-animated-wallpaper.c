@@ -7,8 +7,9 @@
 #include <unistd.h>
 #include <sys/types.h>
 
+static void stop_audio_visualizer(void);
 
-typedef struct {gchar *id,*placeholder;gdouble min,default_value;gint order;} BackendParam;
+typedef struct {gchar *id,*placeholder;gdouble min,max,default_value;gint order;} BackendParam;
 typedef struct {gchar *id,*shader_path;gint order;GPtrArray *params;} BackendEffect;
 static void backend_param_free(gpointer d){BackendParam*p=d;if(!p)return;g_free(p->id);g_free(p->placeholder);g_free(p);}
 static void backend_effect_free(gpointer d){BackendEffect*e=d;if(!e)return;g_free(e->id);g_free(e->shader_path);if(e->params)g_ptr_array_free(e->params,TRUE);g_free(e);}
@@ -16,7 +17,7 @@ static gboolean backend_effect_loaded(GPtrArray*a,const gchar*id){for(guint i=0;
 static gint backend_effect_sort(gconstpointer a,gconstpointer b){const BackendEffect*ea=*(BackendEffect*const*)a,*eb=*(BackendEffect*const*)b;return ea->order!=eb->order?ea->order-eb->order:g_strcmp0(ea->id,eb->id);}
 static gint backend_param_sort(gconstpointer a,gconstpointer b){const BackendParam*pa=*(BackendParam*const*)a,*pb=*(BackendParam*const*)b;return pa->order-pb->order;}
 static BackendParam*backend_activation_param(BackendEffect*e){if(!e||!e->params||!e->params->len)return NULL;for(guint i=0;i<e->params->len;i++){BackendParam*p=g_ptr_array_index(e->params,i);if(g_strcmp0(p->id,"strength")==0)return p;}return g_ptr_array_index(e->params,0);}
-static void backend_load_params(GKeyFile*k,BackendEffect*e){gsize n=0;gchar**g=g_key_file_get_groups(k,&n);for(gsize i=0;g&&i<n;i++){if(!g_str_has_prefix(g[i],"Parameter "))continue;const gchar*id=g[i]+strlen("Parameter ");if(!*id)continue;BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup(id);p->placeholder=g_key_file_has_key(k,g[i],"placeholder",NULL)?g_key_file_get_string(k,g[i],"placeholder",NULL):g_ascii_strup(id,-1);p->min=g_key_file_has_key(k,g[i],"min",NULL)?g_key_file_get_double(k,g[i],"min",NULL):0;p->default_value=g_key_file_has_key(k,g[i],"default",NULL)?g_key_file_get_double(k,g[i],"default",NULL):p->min;p->order=g_key_file_has_key(k,g[i],"order",NULL)?g_key_file_get_integer(k,g[i],"order",NULL):1000;g_ptr_array_add(e->params,p);}g_strfreev(g);if(!e->params->len){BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup("strength");p->placeholder=g_strdup("VALUE");p->min=g_key_file_has_key(k,"Effect","min",NULL)?g_key_file_get_double(k,"Effect","min",NULL):0;p->default_value=g_key_file_has_key(k,"Effect","default",NULL)?g_key_file_get_double(k,"Effect","default",NULL):p->min;g_ptr_array_add(e->params,p);}g_ptr_array_sort(e->params,backend_param_sort);}
+static void backend_load_params(GKeyFile*k,BackendEffect*e){gsize n=0;gchar**g=g_key_file_get_groups(k,&n);for(gsize i=0;g&&i<n;i++){if(!g_str_has_prefix(g[i],"Parameter "))continue;const gchar*id=g[i]+strlen("Parameter ");if(!*id)continue;BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup(id);p->placeholder=g_key_file_has_key(k,g[i],"placeholder",NULL)?g_key_file_get_string(k,g[i],"placeholder",NULL):g_ascii_strup(id,-1);p->min=g_key_file_has_key(k,g[i],"min",NULL)?g_key_file_get_double(k,g[i],"min",NULL):0;p->max=g_key_file_has_key(k,g[i],"max",NULL)?g_key_file_get_double(k,g[i],"max",NULL):100;p->default_value=g_key_file_has_key(k,g[i],"default",NULL)?g_key_file_get_double(k,g[i],"default",NULL):p->min;p->order=g_key_file_has_key(k,g[i],"order",NULL)?g_key_file_get_integer(k,g[i],"order",NULL):1000;g_ptr_array_add(e->params,p);}g_strfreev(g);if(!e->params->len){BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup("strength");p->placeholder=g_strdup("VALUE");p->min=g_key_file_has_key(k,"Effect","min",NULL)?g_key_file_get_double(k,"Effect","min",NULL):0;p->max=g_key_file_has_key(k,"Effect","max",NULL)?g_key_file_get_double(k,"Effect","max",NULL):100;p->default_value=g_key_file_has_key(k,"Effect","default",NULL)?g_key_file_get_double(k,"Effect","default",NULL):p->min;g_ptr_array_add(e->params,p);}g_ptr_array_sort(e->params,backend_param_sort);}
 static void backend_load_effect_dir(GPtrArray*a,const gchar*base){if(!base||!g_file_test(base,G_FILE_TEST_IS_DIR))return;GDir*d=g_dir_open(base,0,NULL);if(!d)return;const gchar*n;while((n=g_dir_read_name(d))){gchar*f=g_build_filename(base,n,NULL),*m=g_build_filename(f,"effect.ini",NULL);if(!g_file_test(m,G_FILE_TEST_IS_REGULAR)){g_free(m);g_free(f);continue;}GKeyFile*k=g_key_file_new();if(!g_key_file_load_from_file(k,m,G_KEY_FILE_NONE,NULL)){g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*id=g_key_file_get_string(k,"Effect","id",NULL),*sn=g_key_file_get_string(k,"Effect","shader",NULL);if(!id||!*id||!sn||!*sn||backend_effect_loaded(a,id)){g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*sp=g_build_filename(f,sn,NULL);if(!g_file_test(sp,G_FILE_TEST_IS_REGULAR)){g_free(sp);g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}BackendEffect*e=g_new0(BackendEffect,1);e->id=id;e->shader_path=sp;e->order=g_key_file_has_key(k,"Effect","order",NULL)?g_key_file_get_integer(k,"Effect","order",NULL):1000;e->params=g_ptr_array_new_with_free_func(backend_param_free);backend_load_params(k,e);g_ptr_array_add(a,e);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);}g_dir_close(d);}
 static GPtrArray*backend_discover_effects(void){GPtrArray*a=g_ptr_array_new_with_free_func(backend_effect_free);gchar*u=g_build_filename(g_get_user_data_dir(),"xfce-animated-wallpaper","effects",NULL);backend_load_effect_dir(a,u);g_free(u);backend_load_effect_dir(a,"./effects");backend_load_effect_dir(a,"/usr/local/share/xfce-animated-wallpaper/effects");backend_load_effect_dir(a,"/usr/share/xfce-animated-wallpaper/effects");g_ptr_array_sort(a,backend_effect_sort);return a;}
 
@@ -264,6 +265,7 @@ static void remove_pidfile(void) {
 }
 
 static gboolean stop_wallpaper(void) {
+    stop_audio_visualizer();
     stop_desktop_icons();
 
     GPid pid = read_pid();
@@ -391,9 +393,152 @@ static gboolean url_is_direct_stream(const gchar *url) {
 
 
 
-static gdouble backend_param_value(GKeyFile*k,BackendEffect*e,BackendParam*p){gchar*g=g_strdup_printf("effect.%s",e->id);gdouble v=p->default_value;if(g_key_file_has_key(k,g,p->id,NULL))v=g_key_file_get_double(k,g,p->id,NULL);else if(p==backend_activation_param(e)&&g_key_file_has_key(k,"effects",e->id,NULL))v=g_key_file_get_double(k,"effects",e->id,NULL);g_free(g);return v;}
-static gchar*materialize_effect_shader(GKeyFile*k,BackendEffect*e){gchar*r=NULL;if(!e||!g_file_get_contents(e->shader_path,&r,NULL,NULL))return NULL;for(guint i=0;i<e->params->len;i++){BackendParam*p=g_ptr_array_index(e->params,i);gchar v[G_ASCII_DTOSTR_BUF_SIZE];g_ascii_formatd(v,sizeof v,"%.6f",backend_param_value(k,e,p));gchar*t=g_strdup_printf("@%s@",p->placeholder);gchar**parts=g_strsplit(r,t,-1);gchar*next=g_strjoinv(v,parts);g_strfreev(parts);g_free(t);g_free(r);r=next;}gchar*d=g_build_filename(g_get_user_cache_dir(),"xfce-animated-wallpaper","shaders",NULL);g_mkdir_with_parents(d,0700);gchar*n=g_strdup_printf("%s-generated.glsl",e->id),*path=g_build_filename(d,n,NULL);if(!g_file_set_contents(path,r,-1,NULL)){g_free(path);path=NULL;}g_free(n);g_free(d);g_free(r);return path;}
-static void add_backend_effect_shader(GPtrArray*a,GKeyFile*k,BackendEffect*e){gchar*p=materialize_effect_shader(k,e);if(!p)return;g_ptr_array_add(a,g_strdup_printf("--glsl-shader=%s",p));g_free(p);}
+static gdouble backend_param_value(GKeyFile *k, BackendEffect *e, BackendParam *p) {
+    gchar *g = g_strdup_printf("effect.%s", e->id);
+    gdouble v = p->default_value;
+    if (g_key_file_has_key(k, g, p->id, NULL))
+        v = g_key_file_get_double(k, g, p->id, NULL);
+    else if (p == backend_activation_param(e) && g_key_file_has_key(k, "effects", e->id, NULL))
+        v = g_key_file_get_double(k, "effects", e->id, NULL);
+    g_free(g);
+    return v;
+}
+
+static gchar *materialize_effect_shader(GKeyFile *k, BackendEffect *e) {
+    gchar *r = NULL;
+    if (!e || !g_file_get_contents(e->shader_path, &r, NULL, NULL))
+        return NULL;
+
+    gboolean audio_enabled = g_key_file_has_key(k, "audio", "enabled", NULL)
+        ? g_key_file_get_boolean(k, "audio", "enabled", NULL) : FALSE;
+    gchar *audio_parameter = g_key_file_has_key(k, "audio", "parameter", NULL)
+        ? g_key_file_get_string(k, "audio", "parameter", NULL) : g_strdup("strength");
+    gboolean uses_audio = FALSE;
+
+    for (guint i = 0; i < e->params->len; i++) {
+        BackendParam *p = g_ptr_array_index(e->params, i);
+        gdouble base = backend_param_value(k, e, p);
+        gchar value[G_ASCII_DTOSTR_BUF_SIZE];
+        gchar *replacement = NULL;
+
+        if (audio_enabled && g_strcmp0(p->id, audio_parameter) == 0) {
+            gchar minv[G_ASCII_DTOSTR_BUF_SIZE];
+            gchar basev[G_ASCII_DTOSTR_BUF_SIZE];
+            g_ascii_formatd(minv, sizeof minv, "%.6f", p->min);
+            g_ascii_formatd(basev, sizeof basev, "%.6f", base);
+            replacement = g_strdup_printf("mix(%s, %s, aw_audio)", minv, basev);
+            uses_audio = TRUE;
+        } else {
+            g_ascii_formatd(value, sizeof value, "%.6f", base);
+            replacement = g_strdup(value);
+        }
+
+        gchar *token = g_strdup_printf("@%s@", p->placeholder);
+        gchar **parts = g_strsplit(r, token, -1);
+        gchar *next = g_strjoinv(replacement, parts);
+        g_strfreev(parts);
+        g_free(token);
+        g_free(replacement);
+        g_free(r);
+        r = next;
+    }
+
+    if (uses_audio) {
+        const gchar *param_block =
+            "//!PARAM aw_audio\n"
+            "//!DESC Live audio level\n"
+            "//!TYPE DYNAMIC float\n"
+            "//!MINIMUM 0.0\n"
+            "//!MAXIMUM 1.0\n"
+            "0.0\n\n";
+        gchar *next = g_strconcat(param_block, r, NULL);
+        g_free(r);
+        r = next;
+    }
+
+    g_free(audio_parameter);
+
+    gchar *d = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", "shaders", NULL);
+    g_mkdir_with_parents(d, 0700);
+    gchar *n = g_strdup_printf("%s-generated.glsl", e->id);
+    gchar *path = g_build_filename(d, n, NULL);
+    if (!g_file_set_contents(path, r, -1, NULL)) {
+        g_free(path);
+        path = NULL;
+    }
+    g_free(n); g_free(d); g_free(r);
+    return path;
+}
+
+static void add_backend_effect_shader(GPtrArray *a, GKeyFile *k, BackendEffect *e) {
+    gchar *p = materialize_effect_shader(k, e);
+    if (!p) return;
+    g_ptr_array_add(a, g_strdup_printf("--glsl-shader=%s", p));
+    g_free(p);
+}
+
+static gchar *audio_ipc_path(void) {
+    const gchar *runtime = g_get_user_runtime_dir();
+    return g_build_filename(runtime ? runtime : "/tmp", "xfce-animated-wallpaper-mpv.sock", NULL);
+}
+
+static gchar *visualizer_pid_path(void) {
+    const gchar *runtime = g_get_user_runtime_dir();
+    return g_build_filename(runtime ? runtime : "/tmp", "xfce-animated-wallpaper-visualizer.pid", NULL);
+}
+
+static GPid read_visualizer_pid(void) {
+    gchar *path = visualizer_pid_path();
+    gchar *text = NULL;
+    GPid pid = 0;
+    if (g_file_get_contents(path, &text, NULL, NULL) && text)
+        pid = (GPid)g_ascii_strtoll(text, NULL, 10);
+    g_free(text); g_free(path);
+    return pid;
+}
+
+static void stop_audio_visualizer(void) {
+    GPid pid = read_visualizer_pid();
+    if (pid > 1) {
+        kill(pid, SIGTERM);
+        g_usleep(50000);
+    }
+    gchar *pidfile = visualizer_pid_path();
+    g_unlink(pidfile);
+    g_free(pidfile);
+    gchar *ipc = audio_ipc_path();
+    g_unlink(ipc);
+    g_free(ipc);
+}
+
+static gboolean start_audio_visualizer(void) {
+    GPid old_pid = read_visualizer_pid();
+    if (old_pid > 1) {
+        kill(old_pid, SIGTERM);
+        g_usleep(50000);
+    }
+    gchar *old_pidfile = visualizer_pid_path();
+    g_unlink(old_pidfile);
+    g_free(old_pidfile);
+
+    gchar *argv[] = {(gchar *)"xfce-animated-wallpaper-visualizer", (gchar *)"--control", NULL};
+    GPid pid = 0;
+    GError *error = NULL;
+    gboolean ok = g_spawn_async(NULL, argv, NULL,
+                                G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD |
+                                G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                                NULL, NULL, &pid, &error);
+    if (!ok) {
+        g_printerr("Could not start audio visualizer: %s\n", error ? error->message : "unknown error");
+        g_clear_error(&error);
+        return FALSE;
+    }
+    gchar *pidfile = visualizer_pid_path();
+    gchar *text = g_strdup_printf("%d\n", (int)pid);
+    g_file_set_contents(pidfile, text, -1, NULL);
+    g_free(text); g_free(pidfile);
+    return TRUE;
+}
 
 static gboolean start_wallpaper(gboolean require_enabled) {
     gchar *cfg = config_path();
@@ -444,6 +589,7 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     gboolean pause_fullscreen = get_bool(kf, "advanced", "pause_fullscreen", TRUE);
     gboolean pause_battery = get_bool(kf, "advanced", "pause_battery", FALSE);
     gboolean desktop_icons = get_bool(kf, "desktop", "show_icons", FALSE);
+    gboolean audio_enabled = get_bool(kf, "audio", "enabled", FALSE);
     gdouble brightness = get_double(kf, "advanced", "brightness", 0.0);
     gdouble contrast = get_double(kf, "advanced", "contrast", 0.0);
     gdouble saturation = get_double(kf, "advanced", "saturation", 0.0);
@@ -513,6 +659,14 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     g_ptr_array_add(argv, g_strdup("--no-border"));
     g_ptr_array_add(argv, g_strdup("--framedrop=vo"));
 
+    gchar *ipc_path = NULL;
+    if (audio_enabled) {
+        ipc_path = audio_ipc_path();
+        g_unlink(ipc_path);
+        g_ptr_array_add(argv, g_strdup("--vo=gpu-next"));
+        g_ptr_array_add(argv, g_strdup_printf("--input-ipc-server=%s", ipc_path));
+    }
+
     if (mute) g_ptr_array_add(argv, g_strdup("--no-audio"));
     gchar *play_media = NULL;
     gchar *static_cache = NULL;
@@ -526,7 +680,8 @@ static gboolean start_wallpaper(gboolean require_enabled) {
             g_clear_error(&cache_err);
             g_ptr_array_free(argv, TRUE);
     g_free(static_cache);
-            g_free(wall_log);
+            g_free(ipc_path);
+    g_free(wall_log);
             g_free(source);
             g_free(video);
             g_free(stream_url);
@@ -619,9 +774,15 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     if (ok && desktop_icons)
         start_desktop_icons();
 
+    if (ok && audio_enabled) {
+        g_usleep(250000);
+        start_audio_visualizer();
+    }
+
     g_ptr_array_free(argv, TRUE);
     if (effects)
         g_ptr_array_free(effects, TRUE);
+    g_free(ipc_path);
     g_free(wall_log);
     g_free(source);
     g_free(video);

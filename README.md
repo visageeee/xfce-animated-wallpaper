@@ -26,7 +26,7 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 
 ### Effects
 
-The **Effects** tab applies GPU shaders through mpv's renderer. Effects are modular and discovered at runtime, and individual effects can expose their own adjustable parameters such as strength, speed, scale or intensity.
+The **Effects** tab applies GPU shaders through mpv's renderer. Effects are modular and discovered at runtime, are listed alphabetically, can provide optional module icons, and can expose their own adjustable parameters such as strength, speed, scale or intensity.
 
 Built-in effects include blur, vignette, film grain, chromatic aberration, scanlines, wave distortion, dream diffusion, bloom and ripple-style animated effects.
 
@@ -55,7 +55,7 @@ The project is intended for **Xfce running under X11**.
 Ubuntu / Xubuntu / Debian build and runtime dependencies:
 
 ```bash
-sudo apt install build-essential libgtk-3-dev libglib2.0-dev mpv ffmpeg x11-utils
+sudo apt install build-essential libgtk-3-dev libglib2.0-dev mpv ffmpeg x11-utils pulseaudio-utils
 ```
 
 You also need `xwinwrap` installed and available in your `PATH`.
@@ -225,3 +225,7 @@ vec4 hook() {
 ```
 
 Restart the settings app after adding or removing an effect. For graphics-driver stability, only one effect can be active at a time.
+
+### Audio-reactive signal
+
+The Audio Visualizer can drive an effect parameter from either **Bass** or **Overall level**. Bass is the default and uses an inexpensive 40–180 Hz band-energy estimate with adaptive normalization, which generally gives more rhythmic movement than raw output level.
