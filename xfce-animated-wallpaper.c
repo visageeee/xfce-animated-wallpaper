@@ -626,8 +626,36 @@ static gboolean start_wallpaper(gboolean require_enabled) {
      */
     gchar *wall_log = wallpaper_log_path();
 
+    /*
+     * Debian packages bundle xwinwrap privately so users do not need to
+     * install it separately. Source/manual installs can still use xwinwrap
+     * from PATH.
+     */
+    const gchar *bundled_xwinwrap =
+        "/usr/lib/xfce-animated-wallpaper/xwinwrap";
+    gchar *xwinwrap_path = NULL;
+
+    if (g_file_test(bundled_xwinwrap, G_FILE_TEST_IS_EXECUTABLE))
+        xwinwrap_path = g_strdup(bundled_xwinwrap);
+    else
+        xwinwrap_path = g_find_program_in_path("xwinwrap");
+
+    if (!xwinwrap_path) {
+        g_printerr(
+            "xwinwrap was not found. Install xwinwrap or use the packaged build.\n");
+        g_ptr_array_free(argv, TRUE);
+        g_free(wall_log);
+        g_free(source);
+        g_free(video);
+        g_free(stream_url);
+        g_free(mode);
+        g_key_file_unref(kf);
+        g_free(cfg);
+        return FALSE;
+    }
+
     const gchar *xw_args[] = {
-        "xwinwrap", "-ov", "-fs", "-ni", "-b", "-nf", "--",
+        xwinwrap_path, "-ov", "-fs", "-ni", "-b", "-nf", "--",
         "sh", "-c",
         "wid=$1; pf=$2; pb=$3; wr=$4; log=$5; shift 5; "
         ": >\"$log\"; "
@@ -683,6 +711,7 @@ static gboolean start_wallpaper(gboolean require_enabled) {
     g_free(static_cache);
             g_free(ipc_path);
     g_free(wall_log);
+            g_free(xwinwrap_path);
             g_free(source);
             g_free(video);
             g_free(stream_url);
@@ -836,6 +865,7 @@ static gboolean start_wallpaper(gboolean require_enabled) {
         g_ptr_array_free(effects, TRUE);
     g_free(ipc_path);
     g_free(wall_log);
+    g_free(xwinwrap_path);
     g_free(source);
     g_free(video);
     g_free(stream_url);

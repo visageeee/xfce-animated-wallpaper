@@ -247,3 +247,14 @@ The Audio Visualizer includes an **Audio device** selector. **Automatic (active 
 ### Full-screen showcase shortcut
 
 Press **Shift+F** in the settings window to show the currently selected wallpaper and active effect full-screen in the foreground. Any key press or mouse click exits the full-screen view. While showcase mode is active it pauses the desktop wallpaper and the settings preview, then resumes them when you exit. When Audio Visualizer control is enabled, audio-reactive parameters continue to respond in the full-screen showcase.
+
+
+### Debian package
+
+`make deb` builds an amd64 Debian package and bundles the build machine's
+`xwinwrap` binary privately under `/usr/lib/xfce-animated-wallpaper/`.
+This makes the resulting `.deb` self-contained with respect to xwinwrap.
+The xwinwrap license notice is installed under
+`/usr/share/doc/xfce-animated-wallpaper/`.
+
+The build machine must already have a working `xwinwrap` executable in `PATH`.
