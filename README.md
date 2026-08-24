@@ -24,13 +24,13 @@ It includes real-time GPU shader effects with a plugin system, presets, and an a
 
 ### Effects
 
-The **Effects** tab applies GPU shaders through mpv's renderer. Effects are modular and discovered at runtime, are listed alphabetically, can provide optional module icons, and can expose their own adjustable parameters such as strength, speed, scale or intensity.
+The **Effects** tab applies GPU shaders through mpv's renderer. Effects are modular and discovered at runtime and can expose their own adjustable parameters such as strength, speed, scale or intensity.
 
-Built-in effects include blur, vignette, chromatic aberration, scanlines, wave and water-ripple distortion, dream diffusion, drifting clouds, god rays, Matrix rain, kaleidoscope, stars, rain-on-glass, bioluminescent and sun effects.
+Built-in effects include blur, vignette, chromatic aberration, scanlines, wave and water-ripple distortion, dream diffusion, drifting clouds, god rays, matrix ASCII rain, kaleidoscope, stars, rain-on-glass, bioluminescent and sun effects.
 
 For graphics-driver stability, only one GPU effect can be active at a time. Enabling one effect automatically disables the others.
 
-Static images can also use animated effects. PNG, JPEG, WebP, BMP and TIFF sources are accepted. To give frame-driven shaders a normal animation clock without repeatedly decoding the original image, static images are automatically converted once to a short 30 FPS H.264 cache video and then looped like an ordinary wallpaper video.
+Static images can also use animated effects. PNG, JPEG, WebP, BMP and TIFF sources are accepted. To give frame-driven shaders a normal animation clock without repeatedly decoding the original image, static images are automatically converted with ffmpeg to a short 30 FPS H.264 cache video and then looped like an ordinary wallpaper video.
 
 ### Advanced settings
 
@@ -53,7 +53,7 @@ The project is intended for **Xfce running under X11**.
 
 ### Debian / Ubuntu package
 
-The easiest installation method is the prebuilt `.deb` from the GitHub release.
+The easiest installation method should be the prebuilt `.deb` from the GitHub release.
 
 ```bash
 sudo apt install ./xfce-animated-wallpaper_0.3.0_amd64.deb
@@ -98,7 +98,7 @@ sudo make uninstall
 
 ## Usage
 
-Choose a video, animated image or static image using the file chooser, clickable preview, or Gallery, or select **Web URL** and enter a network source. Adjust the settings you want, then press **Set Wallpaper**.
+Choose a video, animated image or static image using the file chooser, clicking the preview, or Gallery button, or select **Web URL** and enter a network source. Adjust the settings you want, then press **Set Wallpaper**.
 
 Changing controls only updates the saved configuration. The currently running wallpaper is not changed until **Set Wallpaper** is pressed.
 
@@ -131,13 +131,13 @@ Press **Shift+F** in the settings window to show the currently selected wallpape
 
 Keyboard shortcuts:
 
-- `1`-`4` - switch between the first four settings tabs
+- `1`-`5` - switch between the settings tabs
 - `Enter` - set wallpaper
 - `Shift+F` - full-screen showcase
 
 ## Desktop icons
 
-Animated wallpapers created with `xwinwrap` can cover Xfce's normal desktop icons. The optional **Show desktop icons** setting starts a lightweight companion process, `xfce-animated-wallpaper-icons`, which displays items from the user's XDG Desktop directory above the wallpaper while remaining below normal application windows.
+Animated wallpapers created with `xwinwrap` covers Xfce's normal desktop icons. The optional **Show desktop icons** setting starts a lightweight companion process, `xfce-animated-wallpaper-icons`, which displays items from the user's XDG Desktop directory above the wallpaper while remaining below normal application windows.
 
 The icon layer uses the system icon theme, opens files and folders with their normal applications, launches `.desktop` files, watches the Desktop folder for changes, and stops automatically when the animated wallpaper is turned off.
 
@@ -206,16 +206,14 @@ Stream mode supports direct network media such as HLS (`.m3u8`), DASH, RTSP, and
 Web video page URLs such as YouTube can also be opened through `yt-dlp`, but this path is **experimental** and may freeze, stall, or reconnect during long playback. For continuous wallpaper use, direct stream URLs are recommended when available.
 
 
-
-
 ## Custom effects
 
 Effects are discovered at runtime. Each effect is a folder containing:
 
 ```text
 my-effect/
-â”œâ”€â”€ effect.ini
-â””â”€â”€ shader.glsl
+effect.ini
+shader.glsl
 ```
 
 System effects are installed under `/usr/share/xfce-animated-wallpaper/effects/` by the Debian package, or `/usr/local/share/xfce-animated-wallpaper/effects/` by the default source installation.
