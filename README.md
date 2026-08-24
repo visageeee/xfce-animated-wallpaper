@@ -7,6 +7,8 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 > **Version:** 0.3.0  
 > **Status:** early release. X11 only.
 
+![Demo](demo.webp)
+
 ## Features
 
 - Native GTK3 settings app integrated with Xfce Settings Manager
@@ -52,7 +54,6 @@ Static images can also use animated effects. PNG, JPEG, WebP, BMP and TIFF sourc
 
 Fullscreen and battery pausing suspend the `mpv` process and resume it in place, so playback continues from the same point without rebuilding the wallpaper window.
 
-![Demo](demo.webp)
 
 ## Installation
 
