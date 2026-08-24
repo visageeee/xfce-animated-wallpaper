@@ -2,6 +2,7 @@
 #include <glib/gstdio.h>
 #include <gtk/gtkx.h>
 #include <signal.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -12,6 +13,7 @@ typedef struct {
     gdouble min, max, step, default_value;
     gint digits, order;
     GtkWidget *slider;
+    GtkWidget *audio_badge;
 } EffectParam;
 
 typedef struct {
@@ -33,6 +35,10 @@ typedef struct {
     GtkWidget *preview_eventbox;
     GtkWidget *preview_area;
     GtkWidget *preview_label;
+    GtkWidget *preview_audio_label;
+    GtkWidget *preview_toggle_button;
+    GtkWidget *notebook;
+    GtkWidget *set_wallpaper_button;
     GtkWidget *speed_scale;
     GtkWidget *mode_fill;
     GtkWidget *mode_fit;
@@ -48,8 +54,13 @@ typedef struct {
     GtkWidget *audio_effect_label;
     GtkWidget *audio_parameter_combo;
     GtkWidget *audio_source_combo;
+    GtkWidget *audio_device_combo;
     GtkWidget *audio_sensitivity_scale;
     GtkWidget *audio_smoothing_scale;
+    GtkWidget *preset_list;
+    GtkWidget *preset_values_view;
+    GtkWidget *preset_load_button;
+    GtkWidget *preset_delete_button;
     GtkWidget *interpolation_check;
     GtkWidget *pause_fullscreen_check;
     GtkWidget *pause_battery_check;
@@ -70,9 +81,24 @@ typedef struct {
     gchar *applied_stream;
     gchar *applied_source;
     GPid preview_pid;
+    GPid preview_audio_pid;
+    gchar *preview_ipc_path;
+    guint preview_child_watch_source;
     guint preview_restart_source;
     guint preview_aspect_source;
     gboolean preview_restart_pending;
+    gboolean preview_enabled;
+    GtkWidget *fullscreen_window;
+    GtkWidget *fullscreen_socket;
+    GPid fullscreen_pid;
+    guint fullscreen_child_watch_source;
+    guint fullscreen_start_source;
+    GPid fullscreen_audio_pid;
+    gchar *fullscreen_ipc_path;
+    gboolean fullscreen_paused_preview;
+    gboolean fullscreen_paused_preview_audio;
+    gboolean fullscreen_paused_wallpaper;
+    gboolean fullscreen_paused_wallpaper_audio;
 } App;
 
 
@@ -191,6 +217,11 @@ static gchar *static_image_cache_video(const gchar *image_path, GError **error) 
 
 static gboolean source_is_stream(App *app);
 static void on_setting_changed(GtkWidget *widget, gpointer data);
+static EffectDef *active_effect(App *app);
+static void update_audio_control_indicators(App *app);
+static void stop_preview_audio(App *app);
+static void stop_fullscreen_showcase(App *app);
+static void start_fullscreen_showcase(App *app);
 
 static void effect_param_free(gpointer data) {
     EffectParam *p = data;
@@ -501,6 +532,10 @@ static void save_config(App *app) {
                           g_strcmp0(audio_source_text, "Overall level") == 0
                               ? "overall" : "bass");
     g_free(audio_source_text);
+    const gchar *audio_device_id =
+        gtk_combo_box_get_active_id(GTK_COMBO_BOX(app->audio_device_combo));
+    g_key_file_set_string(kf, "audio", "device",
+                          audio_device_id ? audio_device_id : "automatic");
     g_key_file_set_double(kf, "audio", "sensitivity", gtk_range_get_value(GTK_RANGE(app->audio_sensitivity_scale)));
     g_key_file_set_double(kf, "audio", "smoothing", gtk_range_get_value(GTK_RANGE(app->audio_smoothing_scale)));
     g_key_file_set_integer(kf, "playback", "fps_limit", gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->fps_spin)));
@@ -510,6 +545,16 @@ static void save_config(App *app) {
     g_key_file_set_double(kf, "advanced", "brightness", gtk_range_get_value(GTK_RANGE(app->brightness_scale)));
     g_key_file_set_double(kf, "advanced", "contrast", gtk_range_get_value(GTK_RANGE(app->contrast_scale)));
     g_key_file_set_double(kf, "advanced", "saturation", gtk_range_get_value(GTK_RANGE(app->saturation_scale)));
+
+    /*
+     * Store the active effect explicitly.  The individual values remain for
+     * compatibility and preset parameter storage, but the backend no longer
+     * has to guess which module is active by scanning slider values.
+     */
+    EffectDef *selected_effect = active_effect(app);
+    g_key_file_set_string(kf, "effects", "active",
+                          selected_effect ? selected_effect->id : "");
+
     for (guint i=0; app->effects && i<app->effects->len; i++) {
         EffectDef *e=g_ptr_array_index(app->effects,i);
         gchar *group=g_strdup_printf("effect.%s",e->id);
@@ -548,6 +593,7 @@ static void reset_defaults(App *app) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_enabled_check), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_waveform_check), FALSE);
     gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_source_combo), 0);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_device_combo), 0);
     gtk_range_set_value(GTK_RANGE(app->audio_sensitivity_scale), 2.0);
     gtk_range_set_value(GTK_RANGE(app->audio_smoothing_scale), 0.82);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), 0);
@@ -600,66 +646,176 @@ static void set_autostart(gboolean enabled) {
 }
 
 static gboolean restart_preview_cb(gpointer data);
+static void force_preview_source_refresh(App *app);
+
+static void preview_child_setup(gpointer data) {
+    (void)data;
+    /*
+     * Put the shell adapter and the mpv it execs into their own process
+     * group.  That lets every stop/restart kill the entire preview tree
+     * without touching wallpaper mpv instances.
+     */
+    setpgid(0, 0);
+}
+
 
 static void preview_child_exited(GPid pid, gint status, gpointer data) {
     App *app = data;
-    gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
-    g_mkdir_with_parents(cache_dir, 0700);
-    gchar *debug_path = g_build_filename(cache_dir, "preview-debug.log", NULL);
-    gchar *line = g_strdup_printf("preview child exited: pid=%ld status=%d exited=%d exit_code=%d signaled=%d term_sig=%d\n",
-                                  (long)pid, status,
-                                  WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
-                                  WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
-    FILE *fp = fopen(debug_path, "a");
-    if (fp) { fputs(line, fp); fclose(fp); }
-    g_free(line);
-    g_free(debug_path);
-    g_free(cache_dir);
+    stop_preview_audio(app);
+
+    app->preview_child_watch_source = 0;
 
     if (app->preview_pid == pid)
         app->preview_pid = 0;
+
     g_spawn_close_pid(pid);
 
-    if (app->preview_restart_pending && app->preview_restart_source == 0) {
-        app->preview_restart_source = g_timeout_add(120, restart_preview_cb, app);
-    } else if (!app->preview_restart_pending) {
-        gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
-        gchar *log_path = g_build_filename(cache_dir, "preview-mpv.log", NULL);
+    if (app->preview_enabled &&
+        app->preview_restart_pending &&
+        app->preview_restart_source == 0) {
+        app->preview_restart_source =
+            g_timeout_add(120, restart_preview_cb, app);
+        return;
+    }
+
+    if (!app->preview_restart_pending) {
+        gchar *cache_dir = g_build_filename(
+            g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
+        gchar *log_path =
+            g_build_filename(cache_dir, "preview-mpv.log", NULL);
         gchar *log_text = NULL;
+
         g_file_get_contents(log_path, &log_text, NULL, NULL);
         gchar *friendly = friendly_stream_error_from_text(log_text);
+
         if (friendly) {
             gtk_label_set_text(GTK_LABEL(app->preview_label), friendly);
-            gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
+            gtk_stack_set_visible_child_name(
+                GTK_STACK(app->preview_stack), "message");
         }
+
         g_free(friendly);
         g_free(log_text);
         g_free(log_path);
         g_free(cache_dir);
     }
+
+    (void)status;
+}
+
+static gchar *preview_audio_ipc_path(void) {
+    const gchar *runtime = g_get_user_runtime_dir();
+
+    return g_build_filename(
+        runtime ? runtime : "/tmp",
+        "xfce-animated-wallpaper-preview-mpv.sock",
+        NULL);
+}
+
+static void stop_preview_audio(App *app) {
+    if (app->preview_audio_pid > 1) {
+        kill(app->preview_audio_pid, SIGTERM);
+        g_usleep(50000);
+        g_spawn_close_pid(app->preview_audio_pid);
+        app->preview_audio_pid = 0;
+    }
+
+    if (app->preview_ipc_path) {
+        g_unlink(app->preview_ipc_path);
+        g_free(app->preview_ipc_path);
+        app->preview_ipc_path = NULL;
+    }
+}
+
+static gboolean start_preview_audio(App *app) {
+    stop_preview_audio(app);
+
+    app->preview_ipc_path = preview_audio_ipc_path();
+    g_unlink(app->preview_ipc_path);
+
+    gchar *argv[] = {
+        (gchar *)"xfce-animated-wallpaper-visualizer",
+        (gchar *)"--control",
+        (gchar *)"--no-waveform",
+        (gchar *)"--ipc-path",
+        app->preview_ipc_path,
+        NULL
+    };
+
+    GError *error = NULL;
+    GPid pid = 0;
+
+    gboolean ok = g_spawn_async(
+        NULL,
+        argv,
+        NULL,
+        G_SPAWN_SEARCH_PATH |
+        G_SPAWN_DO_NOT_REAP_CHILD |
+        G_SPAWN_STDOUT_TO_DEV_NULL |
+        G_SPAWN_STDERR_TO_DEV_NULL,
+        NULL,
+        NULL,
+        &pid,
+        &error);
+
+    if (!ok) {
+        g_clear_error(&error);
+        stop_preview_audio(app);
+        return FALSE;
+    }
+
+    app->preview_audio_pid = pid;
+    return TRUE;
 }
 
 static void stop_preview(App *app) {
-    if (!app->preview_pid)
+    stop_preview_audio(app);
+
+    GPid pid = app->preview_pid;
+    if (pid <= 1)
         return;
 
     /*
-     * Preview is started in its own process group.  Kill the group, not just
-     * the shell/mpv PID, otherwise old embedded mpv children can survive
-     * repeated preview restarts.
+     * We deliberately remove the GLib child watch before synchronously
+     * reaping this child.  Otherwise both stop_preview() and the watch could
+     * try to own the same child lifecycle.
      */
-    kill(-app->preview_pid, SIGTERM);
-
-    for (int i = 0; i < 10; i++) {
-        if (kill(app->preview_pid, 0) != 0)
-            break;
-        g_usleep(50000);
+    if (app->preview_child_watch_source) {
+        g_source_remove(app->preview_child_watch_source);
+        app->preview_child_watch_source = 0;
     }
 
-    if (kill(app->preview_pid, 0) == 0)
-        kill(-app->preview_pid, SIGKILL);
+    /* The preview is its own process group (PGID == child PID). */
+    kill(-pid, SIGTERM);
 
-    g_spawn_close_pid(app->preview_pid);
+    gint status = 0;
+    gboolean reaped = FALSE;
+
+    for (int i = 0; i < 20; i++) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+
+        if (result == pid) {
+            reaped = TRUE;
+            break;
+        }
+
+        if (result < 0) {
+            reaped = TRUE; /* already gone/reaped */
+            break;
+        }
+
+        g_usleep(25000);
+    }
+
+    if (!reaped) {
+        kill(-pid, SIGKILL);
+
+        /* After SIGKILL, wait for the direct child so no zombie is left. */
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+            ;
+    }
+
+    g_spawn_close_pid(pid);
     app->preview_pid = 0;
 }
 
@@ -792,34 +948,193 @@ static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event,
 
 
 
-static gchar *materialize_effect_shader(EffectDef *effect) {
-    gchar *rendered=NULL;
-    if(!effect||!g_file_get_contents(effect->shader_path,&rendered,NULL,NULL))return NULL;
-    for(guint i=0;i<effect->params->len;i++){
-        EffectParam *p=g_ptr_array_index(effect->params,i);
-        gchar val[G_ASCII_DTOSTR_BUF_SIZE];
-        g_ascii_formatd(val,sizeof val,"%.6f",gtk_range_get_value(GTK_RANGE(p->slider)));
-        gchar *token=g_strdup_printf("@%s@",p->placeholder);
-        gchar **parts=g_strsplit(rendered,token,-1);
-        gchar *next=g_strjoinv(val,parts);
-        g_strfreev(parts);g_free(token);g_free(rendered);rendered=next;
+static gchar *materialize_effect_shader(App *app, EffectDef *effect) {
+    gchar *rendered = NULL;
+    if (!effect ||
+        !g_file_get_contents(effect->shader_path, &rendered, NULL, NULL))
+        return NULL;
+
+    gboolean audio_enabled =
+        app->audio_enabled_check &&
+        gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(app->audio_enabled_check));
+
+    const gchar *audio_parameter =
+        app->audio_parameter_combo
+            ? gtk_combo_box_get_active_id(
+                  GTK_COMBO_BOX(app->audio_parameter_combo))
+            : NULL;
+
+    gboolean uses_audio = FALSE;
+
+    for (guint i = 0; i < effect->params->len; i++) {
+        EffectParam *p = g_ptr_array_index(effect->params, i);
+
+        gdouble base =
+            gtk_range_get_value(GTK_RANGE(p->slider));
+
+        gchar *replacement = NULL;
+
+        if (audio_enabled &&
+            audio_parameter &&
+            g_strcmp0(p->id, audio_parameter) == 0) {
+            gchar min_value[G_ASCII_DTOSTR_BUF_SIZE];
+            gchar base_value[G_ASCII_DTOSTR_BUF_SIZE];
+
+            g_ascii_formatd(
+                min_value, sizeof min_value, "%.6f", p->min);
+            g_ascii_formatd(
+                base_value, sizeof base_value, "%.6f", base);
+
+            replacement = g_strdup_printf(
+                "mix(%s, %s, aw_audio)",
+                min_value, base_value);
+            uses_audio = TRUE;
+        } else {
+            gchar value[G_ASCII_DTOSTR_BUF_SIZE];
+            g_ascii_formatd(
+                value, sizeof value, "%.6f", base);
+            replacement = g_strdup(value);
+        }
+
+        gchar *token =
+            g_strdup_printf("@%s@", p->placeholder);
+        gchar **parts =
+            g_strsplit(rendered, token, -1);
+        gchar *next =
+            g_strjoinv(replacement, parts);
+
+        g_strfreev(parts);
+        g_free(token);
+        g_free(replacement);
+        g_free(rendered);
+        rendered = next;
     }
-    gchar *dir=g_build_filename(g_get_user_cache_dir(),"xfce-animated-wallpaper","shaders",NULL);
-    g_mkdir_with_parents(dir,0700);
-    gchar *name=g_strdup_printf("%s-generated.glsl",effect->id);
-    gchar *path=g_build_filename(dir,name,NULL);
-    if(!g_file_set_contents(path,rendered,-1,NULL)){g_free(path);path=NULL;}
-    g_free(name);g_free(dir);g_free(rendered);return path;
+
+    if (uses_audio) {
+        const gchar *param_block =
+            "//!PARAM aw_audio\n"
+            "//!DESC Live audio level\n"
+            "//!TYPE DYNAMIC float\n"
+            "//!MINIMUM 0.0\n"
+            "//!MAXIMUM 1.0\n"
+            "0.0\n\n";
+
+        gchar *next =
+            g_strconcat(param_block, rendered, NULL);
+        g_free(rendered);
+        rendered = next;
+    }
+
+    gchar *dir =
+        g_build_filename(
+            g_get_user_cache_dir(),
+            "xfce-animated-wallpaper",
+            "shaders",
+            NULL);
+    g_mkdir_with_parents(dir, 0700);
+
+    gchar *name =
+        g_strdup_printf("%s-generated.glsl", effect->id);
+    gchar *path =
+        g_build_filename(dir, name, NULL);
+
+    if (!g_file_set_contents(path, rendered, -1, NULL)) {
+        g_free(path);
+        path = NULL;
+    }
+
+    g_free(name);
+    g_free(dir);
+    g_free(rendered);
+    return path;
 }
-static void add_effect_shader(GPtrArray *argv,EffectDef *effect){
-    gchar *path=materialize_effect_shader(effect);if(!path)return;
-    g_ptr_array_add(argv,g_strdup_printf("--glsl-shader=%s",path));g_free(path);
+
+static void add_effect_shader(App *app,
+                              GPtrArray *argv,
+                              EffectDef *effect) {
+    gchar *path =
+        materialize_effect_shader(app, effect);
+
+    if (!path)
+        return;
+
+    g_ptr_array_add(
+        argv,
+        g_strdup_printf("--glsl-shader=%s", path));
+    g_free(path);
 }
+
 static EffectDef *active_effect(App *app){
     for(guint i=0;app->effects&&i<app->effects->len;i++){
         EffectDef *e=g_ptr_array_index(app->effects,i);EffectParam *p=effect_activation_param(e);
         if(p&&gtk_range_get_value(GTK_RANGE(p->slider))>p->min+0.001)return e;
     }return NULL;
+}
+
+
+static EffectParam *audio_controlled_param(App *app, EffectDef **effect_out) {
+    if (effect_out)
+        *effect_out = NULL;
+
+    if (!app->audio_enabled_check ||
+        !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->audio_enabled_check)))
+        return NULL;
+
+    EffectDef *effect = active_effect(app);
+    if (!effect || !app->audio_parameter_combo)
+        return NULL;
+
+    const gchar *parameter_id =
+        gtk_combo_box_get_active_id(GTK_COMBO_BOX(app->audio_parameter_combo));
+    if (!parameter_id || !*parameter_id)
+        return NULL;
+
+    for (guint i = 0; i < effect->params->len; i++) {
+        EffectParam *p = g_ptr_array_index(effect->params, i);
+        if (g_strcmp0(p->id, parameter_id) == 0) {
+            if (effect_out)
+                *effect_out = effect;
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+static void update_audio_control_indicators(App *app) {
+    EffectDef *controlled_effect = NULL;
+    EffectParam *controlled =
+        audio_controlled_param(app, &controlled_effect);
+
+    for (guint i = 0; app->effects && i < app->effects->len; i++) {
+        EffectDef *e = g_ptr_array_index(app->effects, i);
+
+        for (guint j = 0; j < e->params->len; j++) {
+            EffectParam *p = g_ptr_array_index(e->params, j);
+
+            if (p->audio_badge) {
+                gtk_widget_set_visible(
+                    p->audio_badge,
+                    e == controlled_effect && p == controlled);
+            }
+        }
+    }
+
+    if (!app->preview_audio_label)
+        return;
+
+    if (controlled_effect && controlled) {
+        gchar *text = g_strdup_printf(
+            "🔊 Audio controlled:\n%s — %s",
+            controlled_effect->name,
+            controlled->name);
+        gtk_label_set_text(GTK_LABEL(app->preview_audio_label), text);
+        gtk_widget_show(app->preview_audio_label);
+        g_free(text);
+    } else {
+        gtk_widget_hide(app->preview_audio_label);
+    }
 }
 
 
@@ -967,6 +1282,7 @@ static void update_preview(App *app) {
     }
 
     g_ptr_array_add(argv, g_strdup("--no-audio"));
+    g_ptr_array_add(argv, g_strdup("--vo=gpu-next"));
     g_ptr_array_add(argv, g_strdup("--no-osc"));
     g_ptr_array_add(argv, g_strdup("--no-input-default-bindings"));
     g_ptr_array_add(argv, g_strdup("--input-cursor-passthrough=yes"));
@@ -987,10 +1303,27 @@ static void update_preview(App *app) {
     else
         g_ptr_array_add(argv, g_strdup("--hwdec=no"));
 
+    gboolean preview_audio_enabled =
+        app->audio_enabled_check &&
+        gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(app->audio_enabled_check));
+
+    if (preview_audio_enabled) {
+        stop_preview_audio(app);
+        app->preview_ipc_path = preview_audio_ipc_path();
+        g_unlink(app->preview_ipc_path);
+
+        g_ptr_array_add(
+            argv,
+            g_strdup_printf(
+                "--input-ipc-server=%s",
+                app->preview_ipc_path));
+    }
+
     /* Built-in effects are GPU shaders and do not require software decoding. */
     EffectDef *effect = active_effect(app);
     if (effect)
-        add_effect_shader(argv, effect);
+        add_effect_shader(app, argv, effect);
 
     if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_stretch))) {
         g_ptr_array_add(argv, g_strdup("--keepaspect=no"));
@@ -1009,10 +1342,15 @@ static void update_preview(App *app) {
     GPid pid = 0;
     gboolean ok = g_spawn_async(NULL, (gchar **)argv->pdata, NULL,
                                 G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
-                                NULL, NULL, &pid, &err);
+                                preview_child_setup, NULL, &pid, &err);
     if (ok) {
         app->preview_pid = pid;
-        g_child_watch_add(pid, preview_child_exited, app);
+        app->preview_child_watch_source =
+            g_child_watch_add(pid, preview_child_exited, app);
+
+        if (preview_audio_enabled)
+            start_preview_audio(app);
+
         gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "video");
         gchar *cache_dir3 = g_build_filename(g_get_user_cache_dir(), "xfce-animated-wallpaper", NULL);
         gchar *debug_path3 = g_build_filename(cache_dir3, "preview-debug.log", NULL);
@@ -1039,8 +1377,15 @@ static void update_preview(App *app) {
 static gboolean restart_preview_cb(gpointer data) {
     App *app = data;
     app->preview_restart_source = 0;
+
+    if (!app->preview_enabled) {
+        app->preview_restart_pending = FALSE;
+        return G_SOURCE_REMOVE;
+    }
+
     if (app->preview_pid > 0)
         return G_SOURCE_REMOVE;
+
     app->preview_restart_pending = FALSE;
     update_preview(app);
     return G_SOURCE_REMOVE;
@@ -1048,30 +1393,78 @@ static gboolean restart_preview_cb(gpointer data) {
 
 static void schedule_preview_restart(App *app) {
     schedule_preview_aspect_update(app);
+
+    if (!app->preview_enabled) {
+        app->preview_restart_pending = FALSE;
+        return;
+    }
+
     app->preview_restart_pending = TRUE;
+
     if (app->preview_restart_source) {
         g_source_remove(app->preview_restart_source);
         app->preview_restart_source = 0;
     }
-    if (app->preview_pid > 0) {
-        kill(app->preview_pid, SIGTERM);
-        return;
-    }
-    app->preview_restart_source = g_timeout_add(120, restart_preview_cb, app);
-}
 
+    /*
+     * Fully tear down and reap the old preview first.  There can therefore
+     * never be two preview mpv process groups alive at the same time.
+     */
+    stop_preview(app);
+
+    app->preview_restart_source =
+        g_timeout_add(120, restart_preview_cb, app);
+}
 
 static gboolean on_preview_plug_removed(GtkSocket *socket, gpointer data) {
     (void)socket;
     App *app = data;
-    if (app->preview_restart_pending && app->preview_pid == 0 && app->preview_restart_source == 0)
-        app->preview_restart_source = g_timeout_add(120, restart_preview_cb, app);
+
+    if (app->preview_enabled &&
+        app->preview_restart_pending &&
+        app->preview_pid == 0 &&
+        app->preview_restart_source == 0) {
+        app->preview_restart_source =
+            g_timeout_add(120, restart_preview_cb, app);
+    }
+
     return TRUE;
 }
 
 static void on_preview_realize(GtkWidget *widget, gpointer data) {
     (void)widget;
     schedule_preview_restart((App *)data);
+}
+
+
+static void on_preview_toggle_clicked(GtkButton *button, gpointer data) {
+    App *app = data;
+
+    if (app->preview_enabled) {
+        app->preview_enabled = FALSE;
+        app->preview_restart_pending = FALSE;
+
+        if (app->preview_restart_source) {
+            g_source_remove(app->preview_restart_source);
+            app->preview_restart_source = 0;
+        }
+
+        stop_preview(app);
+        gtk_label_set_text(GTK_LABEL(app->preview_label), "Preview is off");
+        gtk_stack_set_visible_child_name(GTK_STACK(app->preview_stack), "message");
+        gtk_button_set_label(button, "Turn on preview");
+        return;
+    }
+
+    app->preview_enabled = TRUE;
+    gtk_button_set_label(button, "Turn off preview");
+
+    /*
+     * Re-enable through the same restart state machine used for ordinary
+     * preview updates.  There is no source cache: update_preview() always
+     * reads the current file chooser / URL when the restart occurs.
+     */
+    schedule_preview_restart(app);
 }
 
 static gboolean on_window_focus_in(GtkWidget *widget, GdkEventFocus *event, gpointer data) {
@@ -1090,6 +1483,7 @@ static gboolean on_window_focus_out(GtkWidget *widget, GdkEventFocus *event, gpo
 
 static void on_window_destroy(GtkWidget *widget, gpointer data) {
     App *app = data;
+    stop_fullscreen_showcase(app);
     (void)widget;
     stop_preview((App *)data);
     g_clear_pointer(&app->applied_video, g_free);
@@ -1413,8 +1807,8 @@ static gboolean on_preview_clicked(GtkWidget *widget, GdkEventButton *event, gpo
             app->settings_dirty = TRUE;
             if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
             update_status(app);
-            schedule_preview_restart(app);
             save_config(app);
+            force_preview_source_refresh(app);
 
             g_free(filename);
         }
@@ -1434,7 +1828,7 @@ static void on_source_toggled(GtkToggleButton *button, gpointer data) {
     update_source_controls(app);
     update_status(app);
     save_config(app);
-    schedule_preview_restart(app);
+    force_preview_source_refresh(app);
 }
 
 
@@ -1453,6 +1847,7 @@ static void refresh_audio_effect_controls(App *app) {
         gtk_label_set_text(GTK_LABEL(app->audio_effect_label), "Active effect: None");
         gtk_widget_set_sensitive(app->audio_parameter_combo, FALSE);
         g_free(previous);
+        update_audio_control_indicators(app);
         return;
     }
 
@@ -1473,6 +1868,7 @@ static void refresh_audio_effect_controls(App *app) {
         gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_parameter_combo), 0);
     }
     g_free(previous);
+    update_audio_control_indicators(app);
 }
 
 static void zero_other_effects(App *app,EffectDef *active){
@@ -1494,19 +1890,28 @@ static void on_setting_changed(GtkWidget *widget, gpointer data) {
     app->settings_dirty = TRUE;
     if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
     update_status(app);
+    update_audio_control_indicators(app);
     save_config(app);
+    schedule_preview_restart(app);
+}
+
+static void force_preview_source_refresh(App *app) {
     schedule_preview_restart(app);
 }
 
 static void on_file_set(GtkFileChooserButton *button, gpointer data) {
     (void)button;
     App *app = data;
-    if (app->loading) return;
+    if (app->loading)
+        return;
+
     app->settings_dirty = TRUE;
-    if (app->status_indicator) gtk_widget_queue_draw(app->status_indicator);
+    if (app->status_indicator)
+        gtk_widget_queue_draw(app->status_indicator);
+
     update_status(app);
-    schedule_preview_restart(app);
     save_config(app);
+    force_preview_source_refresh(app);
 }
 
 static void on_autostart_toggled(GtkToggleButton *button, gpointer data) {
@@ -1628,6 +2033,9 @@ static void load_config(App *app) {
     gboolean audio_enabled = loaded && g_key_file_has_key(kf, "audio", "enabled", NULL) ? g_key_file_get_boolean(kf, "audio", "enabled", NULL) : FALSE;
     gboolean audio_waveform = loaded && g_key_file_has_key(kf, "audio", "show_waveform", NULL) ? g_key_file_get_boolean(kf, "audio", "show_waveform", NULL) : FALSE;
     gchar *audio_source = loaded && g_key_file_has_key(kf, "audio", "source", NULL) ? g_key_file_get_string(kf, "audio", "source", NULL) : g_strdup("bass");
+    gchar *audio_device = loaded && g_key_file_has_key(kf, "audio", "device", NULL)
+                            ? g_key_file_get_string(kf, "audio", "device", NULL)
+                            : g_strdup("automatic");
     gchar *audio_parameter = loaded && g_key_file_has_key(kf, "audio", "parameter", NULL) ? g_key_file_get_string(kf, "audio", "parameter", NULL) : g_strdup("strength");
     gdouble audio_sensitivity = loaded && g_key_file_has_key(kf, "audio", "sensitivity", NULL) ? g_key_file_get_double(kf, "audio", "sensitivity", NULL) : 2.0;
     gdouble audio_smoothing = loaded && g_key_file_has_key(kf, "audio", "smoothing", NULL) ? g_key_file_get_double(kf, "audio", "smoothing", NULL) : 0.82;
@@ -1657,6 +2065,9 @@ static void load_config(App *app) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_waveform_check), audio_waveform);
     gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_source_combo),
                              g_strcmp0(audio_source, "overall") == 0 ? 1 : 0);
+    if (!gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->audio_device_combo),
+                                     audio_device))
+        gtk_combo_box_set_active(GTK_COMBO_BOX(app->audio_device_combo), 0);
     gtk_range_set_value(GTK_RANGE(app->audio_sensitivity_scale), CLAMP(audio_sensitivity, 0.1, 10.0));
     gtk_range_set_value(GTK_RANGE(app->audio_smoothing_scale), CLAMP(audio_smoothing, 0.0, 0.98));
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->fps_spin), fps);
@@ -1686,6 +2097,7 @@ static void load_config(App *app) {
         gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->audio_parameter_combo), audio_parameter);
     g_free(audio_parameter);
     g_free(audio_source);
+    g_free(audio_device);
 
     if (g_strcmp0(mode, "fit") == 0)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->mode_fit), TRUE);
@@ -1737,7 +2149,25 @@ static GtkWidget *row(const gchar *title, const gchar *subtitle, GtkWidget *cont
 }
 
 
-static GtkWidget *effect_row(EffectDef *effect, GtkWidget *control) {
+static gboolean on_effect_text_clicked(GtkWidget *widget,
+                                       GdkEventButton *event,
+                                       gpointer data) {
+    (void)widget;
+
+    if (event->button != 1 || event->type != GDK_BUTTON_PRESS)
+        return FALSE;
+
+    GtkExpander *expander = GTK_EXPANDER(data);
+    gtk_expander_set_expanded(
+        expander,
+        !gtk_expander_get_expanded(expander));
+
+    return TRUE;
+}
+
+static GtkWidget *effect_row(EffectDef *effect,
+                             GtkWidget *control,
+                             GtkWidget *expander) {
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
 
     GtkWidget *image = NULL;
@@ -1762,11 +2192,39 @@ static GtkWidget *effect_row(EffectDef *effect, GtkWidget *control) {
     gtk_widget_set_valign(image, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(outer), image, FALSE, FALSE, 0);
 
-    GtkWidget *content = row(effect->name, effect->description, control);
-    gtk_widget_set_margin_top(content, 0);
-    gtk_widget_set_margin_bottom(content, 0);
-    gtk_box_pack_start(GTK_BOX(outer), content, TRUE, TRUE, 0);
+    GtkWidget *text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
 
+    GtkWidget *title = gtk_label_new(NULL);
+    gchar *markup = g_markup_printf_escaped("<b>%s</b>", effect->name);
+    gtk_label_set_markup(GTK_LABEL(title), markup);
+    g_free(markup);
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+    gtk_box_pack_start(GTK_BOX(text), title, FALSE, FALSE, 0);
+
+    if (effect->description && *effect->description) {
+        GtkWidget *description = gtk_label_new(effect->description);
+        gtk_label_set_xalign(GTK_LABEL(description), 0.0);
+        gtk_label_set_line_wrap(GTK_LABEL(description), TRUE);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(description), "dim-label");
+        gtk_box_pack_start(GTK_BOX(text), description, FALSE, FALSE, 0);
+    }
+
+    if (expander) {
+        GtkWidget *click_area = gtk_event_box_new();
+        gtk_event_box_set_visible_window(GTK_EVENT_BOX(click_area), FALSE);
+        gtk_widget_add_events(click_area, GDK_BUTTON_PRESS_MASK);
+        gtk_widget_set_tooltip_text(click_area,
+                                    "Click to show or hide effect parameters");
+        gtk_container_add(GTK_CONTAINER(click_area), text);
+        g_signal_connect(click_area, "button-press-event",
+                         G_CALLBACK(on_effect_text_clicked), expander);
+        gtk_box_pack_start(GTK_BOX(outer), click_area, TRUE, TRUE, 0);
+    } else {
+        gtk_box_pack_start(GTK_BOX(outer), text, TRUE, TRUE, 0);
+    }
+
+    gtk_box_pack_end(GTK_BOX(outer), control, FALSE, FALSE, 0);
     gtk_widget_set_margin_top(outer, 10);
     gtk_widget_set_margin_bottom(outer, 10);
     return outer;
@@ -1796,10 +2254,1341 @@ static void speed_fill_changed(GtkRange *range, gpointer user_data) {
     gtk_range_set_fill_level(range, gtk_range_get_value(range));
 }
 
+
+static gchar *presets_dir(void) {
+    return g_build_filename(g_get_user_config_dir(),
+                            "xfce-animated-wallpaper",
+                            "presets", NULL);
+}
+
+static gchar *preset_safe_filename(const gchar *name) {
+    GString *safe = g_string_new(NULL);
+
+    for (const gchar *p = name; p && *p; p = g_utf8_next_char(p)) {
+        gunichar c = g_utf8_get_char(p);
+
+        if (g_unichar_isalnum(c) || c == '-' || c == '_' || c == ' ') {
+            gchar buf[7] = {0};
+            gint n = g_unichar_to_utf8(c, buf);
+            g_string_append_len(safe, buf, n);
+        } else {
+            g_string_append_c(safe, '_');
+        }
+    }
+
+    g_strstrip(safe->str);
+
+    if (safe->len == 0)
+        g_string_assign(safe, "Preset");
+
+    gchar *filename = g_strdup_printf("%s.ini", safe->str);
+    g_string_free(safe, TRUE);
+    return filename;
+}
+
+static EffectDef *effect_by_id(App *app, const gchar *id) {
+    if (!id || !*id)
+        return NULL;
+
+    for (guint i = 0; app->effects && i < app->effects->len; i++) {
+        EffectDef *e = g_ptr_array_index(app->effects, i);
+        if (g_strcmp0(e->id, id) == 0)
+            return e;
+    }
+
+    return NULL;
+}
+
+static EffectParam *effect_param_by_id(EffectDef *effect, const gchar *id) {
+    if (!effect || !id)
+        return NULL;
+
+    for (guint i = 0; i < effect->params->len; i++) {
+        EffectParam *p = g_ptr_array_index(effect->params, i);
+        if (g_strcmp0(p->id, id) == 0)
+            return p;
+    }
+
+    return NULL;
+}
+
+static gchar *preset_selected_path(App *app) {
+    GtkListBoxRow *row =
+        gtk_list_box_get_selected_row(GTK_LIST_BOX(app->preset_list));
+
+    if (!row)
+        return NULL;
+
+    const gchar *path =
+        g_object_get_data(G_OBJECT(row), "preset-path");
+
+    return path ? g_strdup(path) : NULL;
+}
+
+static gchar *preset_summary_from_file(App *app, const gchar *path) {
+    GKeyFile *kf = g_key_file_new();
+    GError *error = NULL;
+
+    if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, &error)) {
+        gchar *text = g_strdup_printf("Could not read preset:\n%s",
+                                      error ? error->message : "Unknown error");
+        g_clear_error(&error);
+        g_key_file_unref(kf);
+        return text;
+    }
+
+    gchar *name = g_key_file_get_string(kf, "Preset", "name", NULL);
+    gchar *effect_id = g_key_file_get_string(kf, "Effect", "active", NULL);
+    EffectDef *effect = effect_by_id(app, effect_id);
+
+    GString *out = g_string_new(NULL);
+    g_string_append_printf(out, "Preset: %s\n\n",
+                           name && *name ? name : "Unnamed");
+
+    if (effect_id && *effect_id) {
+        g_string_append_printf(out, "Effect: %s\n",
+                               effect ? effect->name : effect_id);
+
+        gchar *group = g_strdup_printf("effect.%s", effect_id);
+
+        if (effect) {
+            for (guint i = 0; i < effect->params->len; i++) {
+                EffectParam *p = g_ptr_array_index(effect->params, i);
+                if (!g_key_file_has_key(kf, group, p->id, NULL))
+                    continue;
+
+                gdouble value =
+                    g_key_file_get_double(kf, group, p->id, NULL);
+                g_string_append_printf(out, "%s: %.*f\n",
+                                       p->name, p->digits, value);
+            }
+        }
+
+        g_free(group);
+    } else {
+        g_string_append(out, "Effect: None\n");
+    }
+
+    g_string_append(out, "\nAudio Visualizer\n");
+
+    gboolean enabled =
+        g_key_file_has_key(kf, "Audio", "enabled", NULL) &&
+        g_key_file_get_boolean(kf, "Audio", "enabled", NULL);
+    gboolean waveform =
+        g_key_file_has_key(kf, "Audio", "show_waveform", NULL) &&
+        g_key_file_get_boolean(kf, "Audio", "show_waveform", NULL);
+
+    gchar *source = g_key_file_has_key(kf, "Audio", "source", NULL)
+        ? g_key_file_get_string(kf, "Audio", "source", NULL)
+        : g_strdup("bass");
+    gchar *parameter = g_key_file_has_key(kf, "Audio", "parameter", NULL)
+        ? g_key_file_get_string(kf, "Audio", "parameter", NULL)
+        : g_strdup("strength");
+    gchar *device = g_key_file_has_key(kf, "Audio", "device", NULL)
+        ? g_key_file_get_string(kf, "Audio", "device", NULL)
+        : g_strdup("automatic");
+
+    gdouble sensitivity =
+        g_key_file_has_key(kf, "Audio", "sensitivity", NULL)
+            ? g_key_file_get_double(kf, "Audio", "sensitivity", NULL)
+            : 2.0;
+    gdouble smoothing =
+        g_key_file_has_key(kf, "Audio", "smoothing", NULL)
+            ? g_key_file_get_double(kf, "Audio", "smoothing", NULL)
+            : 0.82;
+
+    const gchar *parameter_name = parameter;
+    if (effect) {
+        EffectParam *p = effect_param_by_id(effect, parameter);
+        if (p)
+            parameter_name = p->name;
+    }
+
+    g_string_append_printf(out,
+        "Audio reactive: %s\n"
+        "Waveform overlay: %s\n"
+        "Audio source: %s\n"
+        "Audio device: %s\n"
+        "Controlled parameter: %s\n"
+        "Sensitivity: %.1f\n"
+        "Smoothing: %.2f\n",
+        enabled ? "On" : "Off",
+        waveform ? "On" : "Off",
+        g_strcmp0(source, "overall") == 0 ? "Overall level" : "Bass",
+        g_strcmp0(device, "automatic") == 0
+            ? "Automatic (active output)" : device,
+        parameter_name ? parameter_name : "Strength",
+        sensitivity,
+        smoothing);
+
+    g_free(name);
+    g_free(effect_id);
+    g_free(source);
+    g_free(parameter);
+    g_free(device);
+    g_key_file_unref(kf);
+
+    return g_string_free(out, FALSE);
+}
+
+static void update_preset_values(App *app) {
+    GtkTextBuffer *buffer =
+        gtk_text_view_get_buffer(GTK_TEXT_VIEW(app->preset_values_view));
+    gchar *path = preset_selected_path(app);
+
+    if (!path) {
+        gtk_text_buffer_set_text(
+            buffer,
+            "Select a preset to see its saved values.",
+            -1);
+        gtk_widget_set_sensitive(app->preset_load_button, FALSE);
+        gtk_widget_set_sensitive(app->preset_delete_button, FALSE);
+        return;
+    }
+
+    gchar *summary = preset_summary_from_file(app, path);
+    gtk_text_buffer_set_text(buffer, summary, -1);
+    gtk_widget_set_sensitive(app->preset_load_button, TRUE);
+    gtk_widget_set_sensitive(app->preset_delete_button, TRUE);
+
+    g_free(summary);
+    g_free(path);
+}
+
+static void on_preset_selected(GtkListBox *box,
+                               GtkListBoxRow *row,
+                               gpointer data) {
+    (void)box;
+    (void)row;
+    update_preset_values((App *)data);
+}
+
+static gint preset_row_sort(GtkListBoxRow *a,
+                            GtkListBoxRow *b,
+                            gpointer data) {
+    (void)data;
+
+    GtkWidget *ca = gtk_bin_get_child(GTK_BIN(a));
+    GtkWidget *cb = gtk_bin_get_child(GTK_BIN(b));
+
+    const gchar *ta = GTK_IS_LABEL(ca)
+        ? gtk_label_get_text(GTK_LABEL(ca)) : "";
+    const gchar *tb = GTK_IS_LABEL(cb)
+        ? gtk_label_get_text(GTK_LABEL(cb)) : "";
+
+    return g_utf8_collate(ta, tb);
+}
+
+static void refresh_presets(App *app) {
+    GList *children =
+        gtk_container_get_children(GTK_CONTAINER(app->preset_list));
+
+    for (GList *l = children; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(children);
+
+    gchar *dir_path = presets_dir();
+    g_mkdir_with_parents(dir_path, 0700);
+
+    GDir *dir = g_dir_open(dir_path, 0, NULL);
+    if (dir) {
+        const gchar *entry;
+
+        while ((entry = g_dir_read_name(dir))) {
+            if (!g_str_has_suffix(entry, ".ini"))
+                continue;
+
+            gchar *path = g_build_filename(dir_path, entry, NULL);
+            GKeyFile *kf = g_key_file_new();
+            gchar *name = NULL;
+
+            if (g_key_file_load_from_file(
+                    kf, path, G_KEY_FILE_NONE, NULL)) {
+                name = g_key_file_get_string(
+                    kf, "Preset", "name", NULL);
+            }
+
+            if (!name || !*name) {
+                g_free(name);
+                name = g_strdup(entry);
+                gchar *dot = g_strrstr(name, ".ini");
+                if (dot)
+                    *dot = '\0';
+            }
+
+            GtkWidget *label = gtk_label_new(name);
+            gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+            gtk_widget_set_margin_start(label, 8);
+            gtk_widget_set_margin_end(label, 8);
+            gtk_widget_set_margin_top(label, 6);
+            gtk_widget_set_margin_bottom(label, 6);
+
+            GtkWidget *row = gtk_list_box_row_new();
+            gtk_container_add(GTK_CONTAINER(row), label);
+            g_object_set_data_full(
+                G_OBJECT(row), "preset-path",
+                g_strdup(path), g_free);
+            gtk_container_add(GTK_CONTAINER(app->preset_list), row);
+
+            g_free(name);
+            g_key_file_unref(kf);
+            g_free(path);
+        }
+
+        g_dir_close(dir);
+    }
+
+    gtk_list_box_set_sort_func(
+        GTK_LIST_BOX(app->preset_list),
+        preset_row_sort, NULL, NULL);
+
+    gtk_widget_show_all(app->preset_list);
+    gtk_widget_set_sensitive(app->preset_load_button, FALSE);
+    gtk_widget_set_sensitive(app->preset_delete_button, FALSE);
+
+    GtkTextBuffer *buffer =
+        gtk_text_view_get_buffer(GTK_TEXT_VIEW(app->preset_values_view));
+    gtk_text_buffer_set_text(
+        buffer,
+        "Select a preset to see its saved values.",
+        -1);
+
+    g_free(dir_path);
+}
+
+static gboolean save_preset_file(App *app,
+                                 const gchar *name,
+                                 const gchar *path,
+                                 GError **error) {
+    GKeyFile *kf = g_key_file_new();
+
+    g_key_file_set_string(kf, "Preset", "name", name);
+    g_key_file_set_integer(kf, "Preset", "version", 1);
+
+    EffectDef *effect = active_effect(app);
+    g_key_file_set_string(
+        kf, "Effect", "active", effect ? effect->id : "");
+
+    if (effect) {
+        gchar *group = g_strdup_printf("effect.%s", effect->id);
+
+        for (guint i = 0; i < effect->params->len; i++) {
+            EffectParam *p = g_ptr_array_index(effect->params, i);
+            g_key_file_set_double(
+                kf, group, p->id,
+                gtk_range_get_value(GTK_RANGE(p->slider)));
+        }
+
+        g_free(group);
+    }
+
+    g_key_file_set_boolean(
+        kf, "Audio", "enabled",
+        gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(app->audio_enabled_check)));
+    g_key_file_set_boolean(
+        kf, "Audio", "show_waveform",
+        gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(app->audio_waveform_check)));
+
+    gchar *source_text =
+        gtk_combo_box_text_get_active_text(
+            GTK_COMBO_BOX_TEXT(app->audio_source_combo));
+    g_key_file_set_string(
+        kf, "Audio", "source",
+        source_text &&
+        g_strcmp0(source_text, "Overall level") == 0
+            ? "overall" : "bass");
+    g_free(source_text);
+
+    const gchar *device_id =
+        gtk_combo_box_get_active_id(
+            GTK_COMBO_BOX(app->audio_device_combo));
+    g_key_file_set_string(
+        kf, "Audio", "device",
+        device_id ? device_id : "automatic");
+
+    const gchar *parameter =
+        gtk_combo_box_get_active_id(
+            GTK_COMBO_BOX(app->audio_parameter_combo));
+    g_key_file_set_string(
+        kf, "Audio", "parameter",
+        parameter ? parameter : "strength");
+
+    g_key_file_set_double(
+        kf, "Audio", "sensitivity",
+        gtk_range_get_value(
+            GTK_RANGE(app->audio_sensitivity_scale)));
+    g_key_file_set_double(
+        kf, "Audio", "smoothing",
+        gtk_range_get_value(
+            GTK_RANGE(app->audio_smoothing_scale)));
+
+    gsize length = 0;
+    gchar *data = g_key_file_to_data(kf, &length, error);
+    gboolean ok = FALSE;
+
+    if (data)
+        ok = g_file_set_contents(path, data, length, error);
+
+    g_free(data);
+    g_key_file_unref(kf);
+    return ok;
+}
+
+static void on_save_preset_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Save new preset",
+        GTK_WINDOW(app->window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "Cancel", GTK_RESPONSE_CANCEL,
+        "Save", GTK_RESPONSE_ACCEPT,
+        NULL);
+
+    GtkWidget *content =
+        gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *entry = gtk_entry_new();
+
+    gtk_entry_set_placeholder_text(
+        GTK_ENTRY(entry), "Preset name");
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_dialog_set_default_response(
+        GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+
+    gtk_widget_set_margin_start(entry, 12);
+    gtk_widget_set_margin_end(entry, 12);
+    gtk_widget_set_margin_top(entry, 12);
+    gtk_widget_set_margin_bottom(entry, 12);
+    gtk_box_pack_start(GTK_BOX(content), entry, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        const gchar *raw_name =
+            gtk_entry_get_text(GTK_ENTRY(entry));
+        gchar *name = g_strdup(raw_name ? raw_name : "");
+        g_strstrip(name);
+
+        if (*name) {
+            gchar *dir = presets_dir();
+            g_mkdir_with_parents(dir, 0700);
+            gchar *filename = preset_safe_filename(name);
+            gchar *path = g_build_filename(dir, filename, NULL);
+
+            gboolean save = TRUE;
+
+            if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+                GtkWidget *confirm =
+                    gtk_message_dialog_new(
+                        GTK_WINDOW(dialog),
+                        GTK_DIALOG_MODAL,
+                        GTK_MESSAGE_QUESTION,
+                        GTK_BUTTONS_NONE,
+                        "A preset named “%s” already exists.",
+                        name);
+                gtk_message_dialog_format_secondary_text(
+                    GTK_MESSAGE_DIALOG(confirm),
+                    "Replace the existing preset?");
+                gtk_dialog_add_buttons(
+                    GTK_DIALOG(confirm),
+                    "Cancel", GTK_RESPONSE_CANCEL,
+                    "Replace", GTK_RESPONSE_ACCEPT,
+                    NULL);
+
+                save =
+                    gtk_dialog_run(GTK_DIALOG(confirm)) ==
+                    GTK_RESPONSE_ACCEPT;
+                gtk_widget_destroy(confirm);
+            }
+
+            if (save) {
+                GError *error = NULL;
+
+                if (!save_preset_file(app, name, path, &error)) {
+                    GtkWidget *error_dialog =
+                        gtk_message_dialog_new(
+                            GTK_WINDOW(app->window),
+                            GTK_DIALOG_MODAL,
+                            GTK_MESSAGE_ERROR,
+                            GTK_BUTTONS_CLOSE,
+                            "Could not save preset");
+                    gtk_message_dialog_format_secondary_text(
+                        GTK_MESSAGE_DIALOG(error_dialog),
+                        "%s",
+                        error ? error->message : "Unknown error");
+                    gtk_dialog_run(GTK_DIALOG(error_dialog));
+                    gtk_widget_destroy(error_dialog);
+                    g_clear_error(&error);
+                } else {
+                    refresh_presets(app);
+                }
+            }
+
+            g_free(path);
+            g_free(filename);
+            g_free(dir);
+        }
+
+        g_free(name);
+    }
+
+    gtk_widget_destroy(dialog);
+}
+
+static void on_delete_preset_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+
+    gchar *path = preset_selected_path(app);
+    if (!path)
+        return;
+
+    GtkListBoxRow *row =
+        gtk_list_box_get_selected_row(GTK_LIST_BOX(app->preset_list));
+
+    const gchar *display_name = "this preset";
+    if (row) {
+        GtkWidget *child = gtk_bin_get_child(GTK_BIN(row));
+        if (GTK_IS_LABEL(child)) {
+            const gchar *text = gtk_label_get_text(GTK_LABEL(child));
+            if (text && *text)
+                display_name = text;
+        }
+    }
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(app->window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_WARNING,
+        GTK_BUTTONS_NONE,
+        "Delete preset “%s”?",
+        display_name);
+
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(dialog),
+        "This cannot be undone.");
+
+    gtk_dialog_add_buttons(
+        GTK_DIALOG(dialog),
+        "Cancel", GTK_RESPONSE_CANCEL,
+        "Delete", GTK_RESPONSE_ACCEPT,
+        NULL);
+
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if (response == GTK_RESPONSE_ACCEPT) {
+        if (g_unlink(path) != 0) {
+            GtkWidget *error_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(app->window),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_CLOSE,
+                "Could not delete preset");
+
+            gtk_message_dialog_format_secondary_text(
+                GTK_MESSAGE_DIALOG(error_dialog),
+                "%s",
+                g_strerror(errno));
+
+            gtk_dialog_run(GTK_DIALOG(error_dialog));
+            gtk_widget_destroy(error_dialog);
+        } else {
+            refresh_presets(app);
+        }
+    }
+
+    g_free(path);
+}
+
+static void on_load_preset_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+
+    gchar *path = preset_selected_path(app);
+    if (!path)
+        return;
+
+    GKeyFile *kf = g_key_file_new();
+    GError *error = NULL;
+
+    if (!g_key_file_load_from_file(
+            kf, path, G_KEY_FILE_NONE, &error)) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(app->window),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_CLOSE,
+            "Could not load preset");
+        gtk_message_dialog_format_secondary_text(
+            GTK_MESSAGE_DIALOG(dialog), "%s",
+            error ? error->message : "Unknown error");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        g_clear_error(&error);
+        g_key_file_unref(kf);
+        g_free(path);
+        return;
+    }
+
+    gchar *effect_id =
+        g_key_file_get_string(kf, "Effect", "active", NULL);
+    EffectDef *effect = effect_by_id(app, effect_id);
+
+    if (effect_id && *effect_id && !effect) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(app->window),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_CLOSE,
+            "This preset uses an effect that is not installed");
+        gtk_message_dialog_format_secondary_text(
+            GTK_MESSAGE_DIALOG(dialog),
+            "Missing effect: %s", effect_id);
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+
+        g_free(effect_id);
+        g_key_file_unref(kf);
+        g_free(path);
+        return;
+    }
+
+    app->loading = TRUE;
+    app->changing_effects = TRUE;
+
+    /* Presets select exactly one effect, matching the normal UI rule. */
+    for (guint i = 0; app->effects && i < app->effects->len; i++) {
+        EffectDef *e = g_ptr_array_index(app->effects, i);
+        EffectParam *activation = effect_activation_param(e);
+
+        if (activation)
+            gtk_range_set_value(
+                GTK_RANGE(activation->slider), activation->min);
+    }
+
+    if (effect) {
+        gchar *group = g_strdup_printf("effect.%s", effect->id);
+
+        for (guint i = 0; i < effect->params->len; i++) {
+            EffectParam *p = g_ptr_array_index(effect->params, i);
+
+            if (!g_key_file_has_key(kf, group, p->id, NULL))
+                continue;
+
+            gdouble value =
+                g_key_file_get_double(kf, group, p->id, NULL);
+            gtk_range_set_value(
+                GTK_RANGE(p->slider),
+                CLAMP(value, p->min, p->max));
+        }
+
+        g_free(group);
+    }
+
+    app->changing_effects = FALSE;
+
+    gboolean enabled =
+        g_key_file_has_key(kf, "Audio", "enabled", NULL)
+            ? g_key_file_get_boolean(kf, "Audio", "enabled", NULL)
+            : FALSE;
+    gboolean waveform =
+        g_key_file_has_key(kf, "Audio", "show_waveform", NULL)
+            ? g_key_file_get_boolean(kf, "Audio", "show_waveform", NULL)
+            : FALSE;
+    gchar *source =
+        g_key_file_has_key(kf, "Audio", "source", NULL)
+            ? g_key_file_get_string(kf, "Audio", "source", NULL)
+            : g_strdup("bass");
+    gchar *device =
+        g_key_file_has_key(kf, "Audio", "device", NULL)
+            ? g_key_file_get_string(kf, "Audio", "device", NULL)
+            : g_strdup("automatic");
+    gchar *parameter =
+        g_key_file_has_key(kf, "Audio", "parameter", NULL)
+            ? g_key_file_get_string(kf, "Audio", "parameter", NULL)
+            : g_strdup("strength");
+    gdouble sensitivity =
+        g_key_file_has_key(kf, "Audio", "sensitivity", NULL)
+            ? g_key_file_get_double(kf, "Audio", "sensitivity", NULL)
+            : 2.0;
+    gdouble smoothing =
+        g_key_file_has_key(kf, "Audio", "smoothing", NULL)
+            ? g_key_file_get_double(kf, "Audio", "smoothing", NULL)
+            : 0.82;
+
+    gtk_toggle_button_set_active(
+        GTK_TOGGLE_BUTTON(app->audio_enabled_check), enabled);
+    gtk_toggle_button_set_active(
+        GTK_TOGGLE_BUTTON(app->audio_waveform_check), waveform);
+    gtk_combo_box_set_active(
+        GTK_COMBO_BOX(app->audio_source_combo),
+        g_strcmp0(source, "overall") == 0 ? 1 : 0);
+    if (!gtk_combo_box_set_active_id(
+            GTK_COMBO_BOX(app->audio_device_combo), device))
+        gtk_combo_box_set_active(
+            GTK_COMBO_BOX(app->audio_device_combo), 0);
+    gtk_range_set_value(
+        GTK_RANGE(app->audio_sensitivity_scale),
+        CLAMP(sensitivity, 0.1, 10.0));
+    gtk_range_set_value(
+        GTK_RANGE(app->audio_smoothing_scale),
+        CLAMP(smoothing, 0.0, 0.98));
+
+    refresh_audio_effect_controls(app);
+
+    if (!gtk_combo_box_set_active_id(
+            GTK_COMBO_BOX(app->audio_parameter_combo),
+            parameter)) {
+        gtk_combo_box_set_active(
+            GTK_COMBO_BOX(app->audio_parameter_combo), 0);
+    }
+
+    app->loading = FALSE;
+    app->settings_dirty = TRUE;
+
+    save_config(app);
+    update_status(app);
+
+    if (app->status_indicator)
+        gtk_widget_queue_draw(app->status_indicator);
+
+    schedule_preview_restart(app);
+    update_preset_values(app);
+
+    g_free(source);
+    g_free(device);
+    g_free(parameter);
+    g_free(effect_id);
+    g_key_file_unref(kf);
+    g_free(path);
+}
+
+
+static gchar *friendly_audio_device_name(const gchar *source) {
+    if (!source || !*source)
+        return g_strdup("Unknown audio output");
+
+    gchar *lower = g_ascii_strdown(source, -1);
+
+    if (strstr(lower, "snd_aloop") || strstr(lower, "loopback")) {
+        g_free(lower);
+        return g_strdup("ALSA Loopback");
+    }
+
+    if (strstr(lower, "hdmi")) {
+        g_free(lower);
+        return g_strdup("HDMI / DisplayPort");
+    }
+
+    if (strstr(lower, "analog-stereo")) {
+        g_free(lower);
+        return g_strdup("Built-in Analog Stereo");
+    }
+
+    if (strstr(lower, "usb")) {
+        g_free(lower);
+        return g_strdup("USB Audio");
+    }
+
+    g_free(lower);
+
+    /* Fallback: compact the monitor name rather than showing the full ID. */
+    gchar *name = g_strdup(source);
+    gchar *monitor = g_strrstr(name, ".monitor");
+    if (monitor)
+        *monitor = '\0';
+
+    if (strlen(name) > 30) {
+        name[27] = '\0';
+        gchar *short_name = g_strconcat(name, "…", NULL);
+        g_free(name);
+        return short_name;
+    }
+
+    return name;
+}
+
+static void populate_audio_device_combo(GtkComboBoxText *combo) {
+    gtk_combo_box_text_remove_all(combo);
+    gtk_combo_box_text_append(combo, "automatic", "Automatic (active output)");
+
+    gchar *out = NULL;
+    gint status = 0;
+    GError *error = NULL;
+    gchar *argv[] = {
+        (gchar *)"pactl", (gchar *)"list",
+        (gchar *)"short", (gchar *)"sources", NULL
+    };
+
+    if (g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                     NULL, NULL, &out, NULL, &status, &error) &&
+        g_spawn_check_wait_status(status, NULL)) {
+        gchar **lines = g_strsplit(out ? out : "", "\n", -1);
+
+        for (guint i = 0; lines && lines[i]; i++) {
+            if (!*lines[i])
+                continue;
+
+            gchar **fields = g_strsplit(lines[i], "\t", 0);
+            if (fields && fields[1] &&
+                g_str_has_suffix(fields[1], ".monitor")) {
+                gchar *friendly =
+                    friendly_audio_device_name(fields[1]);
+                gtk_combo_box_text_append(
+                    combo, fields[1], friendly);
+                g_free(friendly);
+            }
+            g_strfreev(fields);
+        }
+
+        g_strfreev(lines);
+    }
+
+    g_clear_error(&error);
+    g_free(out);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
+}
+
+
+static GPid runtime_pid_from_file(const gchar *filename) {
+    const gchar *runtime = g_get_user_runtime_dir();
+    gchar *path = g_build_filename(
+        runtime ? runtime : "/tmp",
+        filename,
+        NULL);
+
+    gchar *text = NULL;
+    GPid pid = 0;
+
+    if (g_file_get_contents(path, &text, NULL, NULL) && text)
+        pid = (GPid)g_ascii_strtoll(text, NULL, 10);
+
+    g_free(text);
+    g_free(path);
+    return pid;
+}
+
+static void pause_background_for_fullscreen(App *app) {
+    app->fullscreen_paused_preview = FALSE;
+    app->fullscreen_paused_preview_audio = FALSE;
+    app->fullscreen_paused_wallpaper = FALSE;
+    app->fullscreen_paused_wallpaper_audio = FALSE;
+
+    /*
+     * Preview is launched in its own process group. Stop the group so both
+     * the shell adapter and mpv genuinely stop consuming rendering time.
+     */
+    if (app->preview_pid > 1 && kill(-app->preview_pid, 0) == 0) {
+        if (kill(-app->preview_pid, SIGSTOP) == 0)
+            app->fullscreen_paused_preview = TRUE;
+    }
+
+    if (app->preview_audio_pid > 1 &&
+        kill(app->preview_audio_pid, 0) == 0) {
+        if (kill(app->preview_audio_pid, SIGSTOP) == 0)
+            app->fullscreen_paused_preview_audio = TRUE;
+    }
+
+    /*
+     * The wallpaper PID file contains the xwinwrap process-group leader.
+     * Pausing the whole group stops xwinwrap, its shell, and wallpaper mpv.
+     */
+    GPid wallpaper_pgid =
+        runtime_pid_from_file("xfce-animated-wallpaper.pid");
+
+    if (wallpaper_pgid > 1 &&
+        kill(-wallpaper_pgid, 0) == 0) {
+        if (kill(-wallpaper_pgid, SIGSTOP) == 0)
+            app->fullscreen_paused_wallpaper = TRUE;
+    }
+
+    GPid visualizer_pid =
+        runtime_pid_from_file(
+            "xfce-animated-wallpaper-visualizer.pid");
+
+    if (visualizer_pid > 1 &&
+        kill(visualizer_pid, 0) == 0) {
+        if (kill(visualizer_pid, SIGSTOP) == 0)
+            app->fullscreen_paused_wallpaper_audio = TRUE;
+    }
+}
+
+static void resume_background_after_fullscreen(App *app) {
+    if (app->fullscreen_paused_preview &&
+        app->preview_pid > 1)
+        kill(-app->preview_pid, SIGCONT);
+
+    if (app->fullscreen_paused_preview_audio &&
+        app->preview_audio_pid > 1)
+        kill(app->preview_audio_pid, SIGCONT);
+
+    if (app->fullscreen_paused_wallpaper) {
+        GPid wallpaper_pgid =
+            runtime_pid_from_file(
+                "xfce-animated-wallpaper.pid");
+
+        if (wallpaper_pgid > 1)
+            kill(-wallpaper_pgid, SIGCONT);
+    }
+
+    if (app->fullscreen_paused_wallpaper_audio) {
+        GPid visualizer_pid =
+            runtime_pid_from_file(
+                "xfce-animated-wallpaper-visualizer.pid");
+
+        if (visualizer_pid > 1)
+            kill(visualizer_pid, SIGCONT);
+    }
+
+    app->fullscreen_paused_preview = FALSE;
+    app->fullscreen_paused_preview_audio = FALSE;
+    app->fullscreen_paused_wallpaper = FALSE;
+    app->fullscreen_paused_wallpaper_audio = FALSE;
+}
+
+static gchar *fullscreen_audio_ipc_path(void) {
+    const gchar *runtime = g_get_user_runtime_dir();
+
+    return g_build_filename(
+        runtime ? runtime : "/tmp",
+        "xfce-animated-wallpaper-fullscreen-mpv.sock",
+        NULL);
+}
+
+static void stop_fullscreen_audio(App *app) {
+    if (app->fullscreen_audio_pid > 1) {
+        kill(app->fullscreen_audio_pid, SIGTERM);
+        g_usleep(50000);
+        g_spawn_close_pid(app->fullscreen_audio_pid);
+        app->fullscreen_audio_pid = 0;
+    }
+
+    if (app->fullscreen_ipc_path) {
+        g_unlink(app->fullscreen_ipc_path);
+        g_free(app->fullscreen_ipc_path);
+        app->fullscreen_ipc_path = NULL;
+    }
+}
+
+static gboolean start_fullscreen_audio(App *app) {
+    stop_fullscreen_audio(app);
+
+    app->fullscreen_ipc_path =
+        fullscreen_audio_ipc_path();
+
+    g_unlink(app->fullscreen_ipc_path);
+
+    gchar *argv[] = {
+        (gchar *)"xfce-animated-wallpaper-visualizer",
+        (gchar *)"--control",
+        (gchar *)"--no-waveform",
+        (gchar *)"--ipc-path",
+        app->fullscreen_ipc_path,
+        NULL
+    };
+
+    GError *error = NULL;
+    GPid pid = 0;
+
+    gboolean ok = g_spawn_async(
+        NULL,
+        argv,
+        NULL,
+        G_SPAWN_SEARCH_PATH |
+        G_SPAWN_DO_NOT_REAP_CHILD |
+        G_SPAWN_STDOUT_TO_DEV_NULL |
+        G_SPAWN_STDERR_TO_DEV_NULL,
+        NULL,
+        NULL,
+        &pid,
+        &error);
+
+    if (!ok) {
+        g_clear_error(&error);
+        stop_fullscreen_audio(app);
+        return FALSE;
+    }
+
+    app->fullscreen_audio_pid = pid;
+    return TRUE;
+}
+
+static void fullscreen_child_exited(GPid pid, gint status, gpointer data) {
+    (void)status;
+    App *app = data;
+
+    app->fullscreen_child_watch_source = 0;
+    if (app->fullscreen_pid == pid)
+        app->fullscreen_pid = 0;
+
+    g_spawn_close_pid(pid);
+
+    if (app->fullscreen_window) {
+        GtkWidget *window = app->fullscreen_window;
+        app->fullscreen_window = NULL;
+        app->fullscreen_socket = NULL;
+        gtk_widget_destroy(window);
+    }
+}
+
+static void stop_fullscreen_showcase(App *app) {
+    stop_fullscreen_audio(app);
+    GPid pid = app->fullscreen_pid;
+
+    if (app->fullscreen_start_source) {
+        g_source_remove(app->fullscreen_start_source);
+        app->fullscreen_start_source = 0;
+    }
+
+    if (app->fullscreen_child_watch_source) {
+        g_source_remove(app->fullscreen_child_watch_source);
+        app->fullscreen_child_watch_source = 0;
+    }
+
+    if (pid > 1) {
+        kill(-pid, SIGTERM);
+
+        gint status = 0;
+        gboolean reaped = FALSE;
+
+        for (int i = 0; i < 12; i++) {
+            pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == pid || result < 0) {
+                reaped = TRUE;
+                break;
+            }
+            g_usleep(25000);
+        }
+
+        if (!reaped) {
+            kill(-pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+                ;
+        }
+
+        g_spawn_close_pid(pid);
+        app->fullscreen_pid = 0;
+    }
+
+    if (app->fullscreen_window) {
+        GtkWidget *window = app->fullscreen_window;
+        app->fullscreen_window = NULL;
+        app->fullscreen_socket = NULL;
+        gtk_widget_destroy(window);
+    }
+    resume_background_after_fullscreen(app);
+}
+
+static gboolean on_fullscreen_exit_key(GtkWidget *widget,
+                                       GdkEventKey *event,
+                                       gpointer data) {
+    (void)widget;
+    (void)event;
+    stop_fullscreen_showcase((App *)data);
+    return TRUE;
+}
+
+static gboolean on_fullscreen_exit_click(GtkWidget *widget,
+                                         GdkEventButton *event,
+                                         gpointer data) {
+    (void)widget;
+    (void)event;
+    stop_fullscreen_showcase((App *)data);
+    return TRUE;
+}
+
+static gboolean start_fullscreen_mpv_idle(gpointer data) {
+    App *app = data;
+    app->fullscreen_start_source = 0;
+
+    if (!app->fullscreen_window ||
+        !app->fullscreen_socket ||
+        !gtk_widget_get_realized(app->fullscreen_socket))
+        return G_SOURCE_REMOVE;
+
+    gchar *video = selected_source(app);
+    if (!source_is_valid(app, video)) {
+        g_free(video);
+        stop_fullscreen_showcase(app);
+        return G_SOURCE_REMOVE;
+    }
+
+    Window xid = gtk_socket_get_id(GTK_SOCKET(app->fullscreen_socket));
+
+    GtkAllocation fs_alloc;
+    gtk_widget_get_allocation(app->fullscreen_socket, &fs_alloc);
+    gchar *fs_cache =
+        g_build_filename(g_get_user_cache_dir(),
+                         "xfce-animated-wallpaper", NULL);
+    g_mkdir_with_parents(fs_cache, 0700);
+    gchar *fs_log =
+        g_build_filename(fs_cache, "fullscreen-debug.log", NULL);
+    gchar *fs_line = g_strdup_printf(
+        "fullscreen socket xid=0x%lx mapped=%d size=%dx%d\n",
+        (unsigned long)xid,
+        gtk_widget_get_mapped(app->fullscreen_socket),
+        fs_alloc.width, fs_alloc.height);
+    g_file_set_contents(fs_log, fs_line, -1, NULL);
+    g_free(fs_line);
+    g_free(fs_log);
+    g_free(fs_cache);
+
+    if (xid == 0) {
+        g_free(video);
+        stop_fullscreen_showcase(app);
+        return G_SOURCE_REMOVE;
+    }
+
+    gchar *media = NULL;
+    gchar *static_cache = NULL;
+
+    if (!source_is_stream(app) && path_is_static_image(video)) {
+        GError *cache_error = NULL;
+        static_cache = static_image_cache_video(video, &cache_error);
+
+        if (!static_cache) {
+            g_clear_error(&cache_error);
+            g_free(video);
+            stop_fullscreen_showcase(app);
+            return G_SOURCE_REMOVE;
+        }
+
+        media = g_strdup(static_cache);
+    } else {
+        media = g_strdup(video);
+    }
+
+    gchar speed_num[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar brightness_num[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar contrast_num[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar saturation_num[G_ASCII_DTOSTR_BUF_SIZE];
+
+    g_ascii_formatd(speed_num, sizeof speed_num, "%.3f",
+                    gtk_range_get_value(GTK_RANGE(app->speed_scale)));
+    g_ascii_formatd(brightness_num, sizeof brightness_num, "%.0f",
+                    gtk_range_get_value(GTK_RANGE(app->brightness_scale)));
+    g_ascii_formatd(contrast_num, sizeof contrast_num, "%.0f",
+                    gtk_range_get_value(GTK_RANGE(app->contrast_scale)));
+    g_ascii_formatd(saturation_num, sizeof saturation_num, "%.0f",
+                    gtk_range_get_value(GTK_RANGE(app->saturation_scale)));
+
+    GPtrArray *argv = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(argv, g_strdup("mpv"));
+    g_ptr_array_add(argv, g_strdup_printf("--wid=%lu", (unsigned long)xid));
+    g_ptr_array_add(argv, g_strdup("--really-quiet"));
+    g_ptr_array_add(argv, g_strdup("--no-osc"));
+    g_ptr_array_add(argv, g_strdup("--no-input-default-bindings"));
+    g_ptr_array_add(argv, g_strdup("--no-border"));
+    g_ptr_array_add(argv, g_strdup("--force-window=yes"));
+    g_ptr_array_add(argv, g_strdup("--input-cursor-passthrough=yes"));
+    g_ptr_array_add(argv, g_strdup("--framedrop=vo"));
+    g_ptr_array_add(argv, g_strdup("--vo=gpu-next"));
+    g_ptr_array_add(argv, g_strdup("--no-audio"));
+    g_ptr_array_add(argv, g_strdup("--loop-file=inf"));
+    g_ptr_array_add(argv, g_strdup_printf("--speed=%s", speed_num));
+    g_ptr_array_add(argv, g_strdup_printf("--brightness=%s", brightness_num));
+    g_ptr_array_add(argv, g_strdup_printf("--contrast=%s", contrast_num));
+    g_ptr_array_add(argv, g_strdup_printf("--saturation=%s", saturation_num));
+
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->hwdec_check)))
+        g_ptr_array_add(argv, g_strdup("--hwdec=auto-safe"));
+    else
+        g_ptr_array_add(argv, g_strdup("--hwdec=no"));
+
+    if (source_is_stream(app)) {
+        g_ptr_array_add(argv, g_strdup("--ytdl=yes"));
+        g_ptr_array_add(argv,
+            g_strdup("--script-opts=ytdl_hook-try_ytdl_first=yes"));
+    }
+
+    gboolean fullscreen_audio_enabled =
+        app->audio_enabled_check &&
+        gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(app->audio_enabled_check));
+
+    if (fullscreen_audio_enabled) {
+        stop_fullscreen_audio(app);
+        app->fullscreen_ipc_path =
+            fullscreen_audio_ipc_path();
+        g_unlink(app->fullscreen_ipc_path);
+
+        g_ptr_array_add(
+            argv,
+            g_strdup_printf(
+                "--input-ipc-server=%s",
+                app->fullscreen_ipc_path));
+    }
+
+    EffectDef *effect = active_effect(app);
+    if (effect)
+        add_effect_shader(app, argv, effect);
+
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_stretch))) {
+        g_ptr_array_add(argv, g_strdup("--keepaspect=no"));
+    } else if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->mode_fit))) {
+        g_ptr_array_add(argv, g_strdup("--keepaspect=yes"));
+        g_ptr_array_add(argv, g_strdup("--panscan=0.0"));
+    } else {
+        g_ptr_array_add(argv, g_strdup("--keepaspect=yes"));
+        g_ptr_array_add(argv, g_strdup("--panscan=1.0"));
+    }
+
+    g_ptr_array_add(argv, media);
+    g_ptr_array_add(argv, NULL);
+
+    GError *error = NULL;
+    GPid pid = 0;
+    gboolean ok = g_spawn_async(
+        NULL,
+        (gchar **)argv->pdata,
+        NULL,
+        G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+        preview_child_setup,
+        NULL,
+        &pid,
+        &error);
+
+    if (ok) {
+        app->fullscreen_pid = pid;
+        app->fullscreen_child_watch_source =
+            g_child_watch_add(pid, fullscreen_child_exited, app);
+
+        if (fullscreen_audio_enabled) {
+            /*
+             * mpv may need a moment to create the Unix socket, but the
+             * visualizer retries its IPC connection every control tick.
+             */
+            start_fullscreen_audio(app);
+        }
+    } else {
+        g_clear_error(&error);
+        stop_fullscreen_showcase(app);
+    }
+
+    g_ptr_array_free(argv, TRUE);
+    g_free(static_cache);
+    g_free(video);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean on_fullscreen_socket_click(GtkWidget *widget,
+                                           GdkEventButton *event,
+                                           gpointer data) {
+    (void)widget;
+    (void)event;
+    stop_fullscreen_showcase((App *)data);
+    return TRUE;
+}
+
+static void start_fullscreen_showcase(App *app) {
+    if (app->fullscreen_window) {
+        stop_fullscreen_showcase(app);
+        return;
+    }
+
+    gchar *video = selected_source(app);
+    gboolean valid = source_is_valid(app, video);
+    g_free(video);
+
+    if (!valid)
+        return;
+
+    pause_background_for_fullscreen(app);
+
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    app->fullscreen_window = window;
+
+    gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(window), TRUE);
+    gtk_window_set_skip_pager_hint(GTK_WINDOW(window), TRUE);
+    gtk_window_set_keep_above(GTK_WINDOW(window), TRUE);
+    gtk_window_set_accept_focus(GTK_WINDOW(window), TRUE);
+    gtk_widget_add_events(window, GDK_BUTTON_PRESS_MASK);
+
+    /*
+     * Keep the hierarchy deliberately simple. GtkSocket is the sole child
+     * and fills the entire window; no GtkOverlay/EventBox can paint above it.
+     */
+    app->fullscreen_socket = gtk_socket_new();
+    gtk_widget_set_hexpand(app->fullscreen_socket, TRUE);
+    gtk_widget_set_vexpand(app->fullscreen_socket, TRUE);
+    gtk_widget_add_events(app->fullscreen_socket, GDK_BUTTON_PRESS_MASK);
+    gtk_container_add(GTK_CONTAINER(window), app->fullscreen_socket);
+
+    g_signal_connect(
+        window, "key-press-event",
+        G_CALLBACK(on_fullscreen_exit_key), app);
+    g_signal_connect(
+        window, "button-press-event",
+        G_CALLBACK(on_fullscreen_exit_click), app);
+    g_signal_connect(
+        app->fullscreen_socket, "button-press-event",
+        G_CALLBACK(on_fullscreen_socket_click), app);
+
+    gtk_widget_show_all(window);
+    gtk_window_fullscreen(GTK_WINDOW(window));
+    gtk_window_present(GTK_WINDOW(window));
+    gtk_widget_grab_focus(window);
+
+    /*
+     * Fullscreening is asynchronous under X11. Waiting a little gives the
+     * toplevel and GtkSocket a real, mapped size before mpv receives the XID.
+     */
+    app->fullscreen_start_source =
+        g_timeout_add(180, start_fullscreen_mpv_idle, app);
+}
+
+static gboolean on_window_key_press(GtkWidget *widget,
+                                    GdkEventKey *event,
+                                    gpointer data) {
+    (void)widget;
+    App *app = data;
+
+    if ((event->state & GDK_SHIFT_MASK) &&
+        (event->keyval == GDK_KEY_f ||
+         event->keyval == GDK_KEY_F)) {
+        start_fullscreen_showcase(app);
+        return TRUE;
+    }
+
+    switch (event->keyval) {
+        case GDK_KEY_1:
+        case GDK_KEY_KP_1:
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 0);
+            return TRUE;
+        case GDK_KEY_2:
+        case GDK_KEY_KP_2:
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 1);
+            return TRUE;
+        case GDK_KEY_3:
+        case GDK_KEY_KP_3:
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 2);
+            return TRUE;
+        case GDK_KEY_4:
+        case GDK_KEY_KP_4:
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 3);
+            return TRUE;
+        case GDK_KEY_5:
+        case GDK_KEY_KP_5:
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 4);
+            return TRUE;
+        case GDK_KEY_Return:
+        case GDK_KEY_KP_Enter:
+            gtk_button_clicked(GTK_BUTTON(app->set_wallpaper_button));
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
 int main(int argc, char **argv) {
     gtk_init(&argc, &argv);
 
     App app = {0};
+    app.preview_enabled = TRUE;
 
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app.window), "Animated Wallpaper");
@@ -1809,6 +3598,7 @@ int main(int argc, char **argv) {
     g_signal_connect(app.window, "focus-in-event", G_CALLBACK(on_window_focus_in), &app);
     g_signal_connect(app.window, "focus-out-event", G_CALLBACK(on_window_focus_out), &app);
     g_signal_connect(app.window, "configure-event", G_CALLBACK(on_window_configure), &app);
+    g_signal_connect(app.window, "key-press-event", G_CALLBACK(on_window_key_press), &app);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
     gtk_container_add(GTK_CONTAINER(app.window), root);
@@ -1817,6 +3607,7 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(root), content, TRUE, TRUE, 0);
 
     GtkWidget *notebook = gtk_notebook_new();
+    app.notebook = notebook;
 
     GtkWidget *general_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(general_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
@@ -1866,8 +3657,34 @@ int main(int argc, char **argv) {
     gtk_widget_set_margin_top(preview_frame, 10);
     gtk_widget_set_margin_bottom(preview_frame, 10);
     /* Keep the live preview outside the notebook so it remains visible on every tab. */
+    GtkWidget *preview_column = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_valign(preview_column, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(preview_column, GTK_ALIGN_CENTER);
+
     gtk_widget_set_valign(preview_frame, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(content), preview_frame, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(preview_column), preview_frame, FALSE, FALSE, 0);
+
+    app.preview_audio_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(app.preview_audio_label), 0.5);
+    gtk_label_set_justify(GTK_LABEL(app.preview_audio_label), GTK_JUSTIFY_CENTER);
+    gtk_label_set_line_wrap(GTK_LABEL(app.preview_audio_label), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(app.preview_audio_label), PANGO_WRAP_WORD_CHAR);
+    gtk_widget_set_size_request(app.preview_audio_label, 250, -1);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(app.preview_audio_label), "dim-label");
+    gtk_widget_set_no_show_all(app.preview_audio_label, TRUE);
+    gtk_widget_hide(app.preview_audio_label);
+    gtk_box_pack_start(GTK_BOX(preview_column),
+                       app.preview_audio_label, FALSE, FALSE, 0);
+
+    app.preview_toggle_button = gtk_button_new_with_label("Turn off preview");
+    gtk_widget_set_size_request(app.preview_toggle_button, 250, -1);
+    gtk_widget_set_tooltip_text(app.preview_toggle_button,
+                                "Stop or restart the live wallpaper preview.");
+    gtk_box_pack_start(GTK_BOX(preview_column),
+                       app.preview_toggle_button, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(content), preview_column, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
 
     GtkWidget *source_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -2058,13 +3875,32 @@ int main(int argc, char **argv) {
             EffectDef *e=g_ptr_array_index(app.effects,i);EffectParam *a=effect_activation_param(e);if(!a)continue;
             a->slider=gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,a->min,a->max,a->step);
             gtk_widget_set_size_request(a->slider,260,-1);gtk_scale_set_digits(GTK_SCALE(a->slider),a->digits);gtk_scale_set_value_pos(GTK_SCALE(a->slider),GTK_POS_RIGHT);gtk_range_set_value(GTK_RANGE(a->slider),a->default_value);
-            gtk_box_pack_start(GTK_BOX(effects),effect_row(e,a->slider),FALSE,FALSE,0);
-            g_signal_connect(a->slider,"value-changed",G_CALLBACK(on_effect_changed),&app);
+            GtkWidget *expander = NULL;
             if (e->params->len > 1) {
-                GtkWidget *expander = gtk_expander_new("Parameters");
+                expander = gtk_expander_new("Parameters");
                 gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
                 gtk_widget_set_margin_start(expander, 58);
                 gtk_widget_set_margin_end(expander, 4);
+            }
+
+            GtkWidget *activation_control =
+                gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+            a->audio_badge = gtk_label_new("Audio controlled");
+            gtk_style_context_add_class(
+                gtk_widget_get_style_context(a->audio_badge), "dim-label");
+            gtk_widget_set_no_show_all(a->audio_badge, TRUE);
+            gtk_widget_hide(a->audio_badge);
+            gtk_box_pack_start(GTK_BOX(activation_control),
+                               a->audio_badge, FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(activation_control),
+                               a->slider, FALSE, FALSE, 0);
+
+            gtk_box_pack_start(GTK_BOX(effects),
+                               effect_row(e, activation_control, expander),
+                               FALSE, FALSE, 0);
+            g_signal_connect(a->slider,"value-changed",G_CALLBACK(on_effect_changed),&app);
+
+            if (expander) {
                 gtk_box_pack_start(GTK_BOX(effects), expander, FALSE, FALSE, 0);
 
                 GtkWidget *param_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -2082,7 +3918,19 @@ int main(int argc, char **argv) {
                     gtk_scale_set_value_pos(GTK_SCALE(p->slider),GTK_POS_RIGHT);
                     gtk_range_set_value(GTK_RANGE(p->slider),p->default_value);
 
-                    GtkWidget *pr=row(p->name,"",p->slider);
+                    GtkWidget *param_control =
+                        gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+                    p->audio_badge = gtk_label_new("Audio controlled");
+                    gtk_style_context_add_class(
+                        gtk_widget_get_style_context(p->audio_badge), "dim-label");
+                    gtk_widget_set_no_show_all(p->audio_badge, TRUE);
+                    gtk_widget_hide(p->audio_badge);
+                    gtk_box_pack_start(GTK_BOX(param_control),
+                                       p->audio_badge, FALSE, FALSE, 0);
+                    gtk_box_pack_start(GTK_BOX(param_control),
+                                       p->slider, FALSE, FALSE, 0);
+
+                    GtkWidget *pr=row(p->name,"",param_control);
                     gtk_box_pack_start(GTK_BOX(param_box),pr,FALSE,FALSE,0);
 
                     g_signal_connect(p->slider,"value-changed",
@@ -2119,6 +3967,15 @@ int main(int argc, char **argv) {
     gtk_widget_set_margin_top(app.audio_effect_label, 8);
     gtk_box_pack_start(GTK_BOX(audio), app.audio_effect_label, FALSE, FALSE, 0);
 
+    app.audio_device_combo = gtk_combo_box_text_new();
+    populate_audio_device_combo(GTK_COMBO_BOX_TEXT(app.audio_device_combo));
+    gtk_widget_set_size_request(app.audio_device_combo, 220, -1);
+    gtk_widget_set_hexpand(app.audio_device_combo, FALSE);
+    gtk_widget_set_halign(app.audio_device_combo, GTK_ALIGN_END);
+    gtk_box_pack_start(GTK_BOX(audio), row("Audio device",
+        "Automatic samples available output monitor sources and follows the one carrying audio. Choose a specific monitor to override it.",
+        app.audio_device_combo), FALSE, FALSE, 0);
+
     app.audio_source_combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.audio_source_combo), "Bass");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.audio_source_combo), "Overall level");
@@ -2154,6 +4011,110 @@ int main(int argc, char **argv) {
 
     refresh_audio_effect_controls(&app);
 
+    GtkWidget *presets = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(presets), 10);
+    gtk_notebook_append_page(
+        GTK_NOTEBOOK(notebook), presets, gtk_label_new("Presets"));
+
+    GtkWidget *preset_intro = gtk_label_new(
+        "Save and load Effects and Audio Visualizer settings. "
+        "Loading a preset changes the controls but does not apply them to "
+        "the desktop until Set Wallpaper is pressed.");
+    gtk_label_set_xalign(GTK_LABEL(preset_intro), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(preset_intro), TRUE);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(preset_intro), "dim-label");
+    gtk_box_pack_start(GTK_BOX(presets), preset_intro, FALSE, FALSE, 0);
+
+    GtkWidget *preset_content =
+        gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_box_pack_start(
+        GTK_BOX(presets), preset_content, TRUE, TRUE, 0);
+
+    GtkWidget *preset_list_scroll =
+        gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(
+        GTK_SCROLLED_WINDOW(preset_list_scroll),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(preset_list_scroll, 220, 280);
+
+    app.preset_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(
+        GTK_LIST_BOX(app.preset_list), GTK_SELECTION_SINGLE);
+    gtk_container_add(
+        GTK_CONTAINER(preset_list_scroll), app.preset_list);
+    gtk_box_pack_start(
+        GTK_BOX(preset_content),
+        preset_list_scroll, FALSE, FALSE, 0);
+
+    GtkWidget *values_box =
+        gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_box_pack_start(
+        GTK_BOX(preset_content), values_box, TRUE, TRUE, 0);
+
+    GtkWidget *values_label = gtk_label_new("Preset values");
+    gtk_label_set_xalign(GTK_LABEL(values_label), 0.0);
+    gtk_box_pack_start(
+        GTK_BOX(values_box), values_label, FALSE, FALSE, 0);
+
+    GtkWidget *values_scroll =
+        gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(
+        GTK_SCROLLED_WINDOW(values_scroll),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(
+        GTK_BOX(values_box), values_scroll, TRUE, TRUE, 0);
+
+    app.preset_values_view = gtk_text_view_new();
+    gtk_text_view_set_editable(
+        GTK_TEXT_VIEW(app.preset_values_view), FALSE);
+    gtk_text_view_set_cursor_visible(
+        GTK_TEXT_VIEW(app.preset_values_view), FALSE);
+    gtk_text_view_set_wrap_mode(
+        GTK_TEXT_VIEW(app.preset_values_view), GTK_WRAP_WORD_CHAR);
+    gtk_container_add(
+        GTK_CONTAINER(values_scroll), app.preset_values_view);
+
+    GtkWidget *preset_buttons =
+        gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(
+        GTK_BOX(presets), preset_buttons, FALSE, FALSE, 0);
+
+    GtkWidget *save_preset_button =
+        gtk_button_new_with_label("Save new preset");
+    gtk_box_pack_start(
+        GTK_BOX(preset_buttons),
+        save_preset_button, FALSE, FALSE, 0);
+
+    app.preset_load_button =
+        gtk_button_new_with_label("Load preset");
+    gtk_widget_set_sensitive(app.preset_load_button, FALSE);
+    gtk_box_pack_start(
+        GTK_BOX(preset_buttons),
+        app.preset_load_button, FALSE, FALSE, 0);
+
+    app.preset_delete_button =
+        gtk_button_new_with_label("Delete preset");
+    gtk_widget_set_sensitive(app.preset_delete_button, FALSE);
+    gtk_box_pack_start(
+        GTK_BOX(preset_buttons),
+        app.preset_delete_button, FALSE, FALSE, 0);
+
+    g_signal_connect(
+        app.preset_list, "row-selected",
+        G_CALLBACK(on_preset_selected), &app);
+    g_signal_connect(
+        save_preset_button, "clicked",
+        G_CALLBACK(on_save_preset_clicked), &app);
+    g_signal_connect(
+        app.preset_load_button, "clicked",
+        G_CALLBACK(on_load_preset_clicked), &app);
+    g_signal_connect(
+        app.preset_delete_button, "clicked",
+        G_CALLBACK(on_delete_preset_clicked), &app);
+
+    refresh_presets(&app);
+
     GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(root), sep, FALSE, FALSE, 2);
 
@@ -2180,6 +4141,7 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(root), bottom, FALSE, FALSE, 0);
 
     GtkWidget *set_wallpaper = gtk_button_new_with_label("Set Wallpaper");
+    app.set_wallpaper_button = set_wallpaper;
     gtk_style_context_add_class(gtk_widget_get_style_context(set_wallpaper), "suggested-action");
     gtk_widget_set_hexpand(set_wallpaper, TRUE);
     gtk_widget_set_size_request(set_wallpaper, -1, 44);
@@ -2188,6 +4150,8 @@ int main(int argc, char **argv) {
     g_signal_connect(app.preview_area, "realize", G_CALLBACK(on_preview_realize), &app);
     g_signal_connect(app.preview_area, "plug-removed", G_CALLBACK(on_preview_plug_removed), &app);
     g_signal_connect(app.preview_eventbox, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
+    g_signal_connect(app.preview_toggle_button, "clicked",
+                     G_CALLBACK(on_preview_toggle_clicked), &app);
     gtk_widget_add_events(app.preview_area, GDK_BUTTON_PRESS_MASK);
     g_signal_connect(app.preview_area, "button-press-event", G_CALLBACK(on_preview_clicked), &app);
     g_signal_connect(app.source_local, "toggled", G_CALLBACK(on_source_toggled), &app);
@@ -2209,6 +4173,7 @@ int main(int argc, char **argv) {
     g_signal_connect(app.audio_enabled_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.audio_waveform_check, "toggled", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.audio_source_combo, "changed", G_CALLBACK(on_setting_changed), &app);
+    g_signal_connect(app.audio_device_combo, "changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.audio_parameter_combo, "changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.audio_sensitivity_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
     g_signal_connect(app.audio_smoothing_scale, "value-changed", G_CALLBACK(on_setting_changed), &app);
@@ -2224,6 +4189,7 @@ int main(int argc, char **argv) {
 
     load_config(&app);
     gtk_widget_show_all(app.window);
+    update_audio_control_indicators(&app);
     schedule_preview_aspect_update(&app);
     app.status_poll_source = g_timeout_add_seconds(2, status_poll_cb, &app);
     update_source_controls(&app);

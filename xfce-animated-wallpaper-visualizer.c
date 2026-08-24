@@ -2,6 +2,7 @@
 #include <gio/gio.h>
 #include <glib.h>
 #include <math.h>
+#include <errno.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -27,6 +28,9 @@ typedef struct {
     gdouble bass_floor;
     gdouble bass_ceiling;
     gchar *audio_source;
+    gchar *audio_device;
+    gchar *capture_device;
+    guint device_rescan_timer;
     gdouble sensitivity;
     gdouble smoothing;
     gboolean control_mode;
@@ -56,11 +60,15 @@ static void load_audio_config(Visualizer *v) {
         v->audio_source = g_key_file_has_key(kf, "audio", "source", NULL)
             ? g_key_file_get_string(kf, "audio", "source", NULL)
             : g_strdup("bass");
+        v->audio_device = g_key_file_has_key(kf, "audio", "device", NULL)
+            ? g_key_file_get_string(kf, "audio", "device", NULL)
+            : g_strdup("automatic");
     } else {
         v->show_waveform = TRUE;
         v->sensitivity = 2.0;
         v->smoothing = 0.82;
         v->audio_source = g_strdup("bass");
+        v->audio_device = g_strdup("automatic");
     }
     v->sensitivity = CLAMP(v->sensitivity, 0.1, 10.0);
     v->smoothing = CLAMP(v->smoothing, 0.0, 0.98);
@@ -70,44 +78,187 @@ static void load_audio_config(Visualizer *v) {
         g_free(v->audio_source);
         v->audio_source = g_strdup("bass");
     }
+    if (!v->audio_device || !*v->audio_device) {
+        g_free(v->audio_device);
+        v->audio_device = g_strdup("automatic");
+    }
     v->bass_floor = 0.002;
     v->bass_ceiling = 0.06;
     g_key_file_unref(kf);
     g_free(path);
 }
 
-static void stop_capture(Visualizer *v) {
-    if (v->control_timer) g_source_remove(v->control_timer);
-    if (v->audio_watch) g_source_remove(v->audio_watch);
+static void stop_capture_stream(Visualizer *v) {
+    if (v->audio_watch) {
+        g_source_remove(v->audio_watch);
+        v->audio_watch = 0;
+    }
+
     if (v->audio_channel) {
         g_io_channel_shutdown(v->audio_channel, TRUE, NULL);
         g_io_channel_unref(v->audio_channel);
+        v->audio_channel = NULL;
     }
+
     if (v->parec_pid > 1) {
         kill(v->parec_pid, SIGTERM);
         g_spawn_close_pid(v->parec_pid);
+        v->parec_pid = 0;
     }
-    g_free(v->ipc_path);
-    g_free(v->audio_source);
 }
 
-static gchar *default_monitor_source(void) {
-    gchar *out = NULL, *err = NULL;
+static void stop_capture(Visualizer *v) {
+    if (v->control_timer) {
+        g_source_remove(v->control_timer);
+        v->control_timer = 0;
+    }
+    if (v->device_rescan_timer) {
+        g_source_remove(v->device_rescan_timer);
+        v->device_rescan_timer = 0;
+    }
+
+    stop_capture_stream(v);
+
+    g_free(v->capture_device);
+    v->capture_device = NULL;
+    g_free(v->ipc_path);
+    v->ipc_path = NULL;
+    g_free(v->audio_source);
+    v->audio_source = NULL;
+    g_free(v->audio_device);
+    v->audio_device = NULL;
+}
+
+static GPtrArray *monitor_sources(void) {
+    GPtrArray *sources = g_ptr_array_new_with_free_func(g_free);
+    gchar *out = NULL;
     gint status = 0;
     GError *error = NULL;
-    gchar *argv[] = {(gchar *)"pactl", (gchar *)"get-default-sink", NULL};
+
+    gchar *argv[] = {
+        (gchar *)"pactl",
+        (gchar *)"list",
+        (gchar *)"short",
+        (gchar *)"sources",
+        NULL
+    };
+
     if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
-                      NULL, NULL, &out, &err, &status, &error)) {
-        g_printerr("Could not run pactl: %s\n", error ? error->message : "unknown error");
-        g_clear_error(&error); g_free(out); g_free(err); return NULL;
+                      NULL, NULL, &out, NULL, &status, &error)) {
+        g_clear_error(&error);
+        g_free(out);
+        return sources;
     }
+
     if (!g_spawn_check_wait_status(status, NULL)) {
-        g_free(out); g_free(err); return NULL;
+        g_free(out);
+        return sources;
     }
-    g_strstrip(out);
-    gchar *monitor = (out && *out) ? g_strdup_printf("%s.monitor", out) : NULL;
-    g_free(out); g_free(err); return monitor;
+
+    gchar **lines = g_strsplit(out ? out : "", "\n", -1);
+    for (guint i = 0; lines && lines[i]; i++) {
+        if (!*lines[i])
+            continue;
+
+        gchar **fields = g_strsplit(lines[i], "\t", 0);
+        if (fields && fields[1] &&
+            g_str_has_suffix(fields[1], ".monitor")) {
+            g_ptr_array_add(sources, g_strdup(fields[1]));
+        }
+        g_strfreev(fields);
+    }
+
+    g_strfreev(lines);
+    g_free(out);
+    return sources;
 }
+
+static gdouble sample_monitor_rms(const gchar *source_name) {
+    if (!source_name || !*source_name)
+        return 0.0;
+
+    gchar *quoted = g_shell_quote(source_name);
+
+    /*
+     * Capture about 180 ms from the monitor, convert the signed 16-bit PCM
+     * to text with od, and calculate RMS in awk.  Producing text here avoids
+     * the embedded-NUL problem of trying to measure raw PCM returned by
+     * g_spawn_sync().
+     */
+    gchar *command = g_strdup_printf(
+        "timeout 0.18s parec --device=%s --raw --format=s16le "
+        "--rate=8000 --channels=1 2>/dev/null | "
+        "od -An -v -t d2 | "
+        "awk '{for(i=1;i<=NF;i++){x=$i/32768.0; s+=x*x; n++}} "
+        "END{if(n>0) printf \"%%.9f\\n\", sqrt(s/n); else print \"0\"}'",
+        quoted);
+
+    gchar *out = NULL;
+    gint status = 0;
+    GError *error = NULL;
+
+    gboolean ok = g_spawn_command_line_sync(
+        command, &out, NULL, &status, &error);
+
+    g_free(command);
+    g_free(quoted);
+
+    if (!ok) {
+        g_clear_error(&error);
+        g_free(out);
+        return 0.0;
+    }
+
+    gdouble rms = out ? g_ascii_strtod(out, NULL) : 0.0;
+    g_free(out);
+    return MAX(rms, 0.0);
+}
+
+static gchar *automatic_monitor_source(void) {
+    GPtrArray *sources = monitor_sources();
+    if (!sources || sources->len == 0) {
+        if (sources)
+            g_ptr_array_free(sources, TRUE);
+        return NULL;
+    }
+
+    gchar *best = NULL;
+    gdouble best_score = -1.0;
+
+    for (guint i = 0; i < sources->len; i++) {
+        const gchar *name = g_ptr_array_index(sources, i);
+        gdouble score = sample_monitor_rms(name);
+
+        /*
+         * Virtual ALSA loopback outputs are frequently default routing
+         * devices but may contain silence. Prefer a real hardware monitor
+         * when measured activity is otherwise indistinguishable.
+         */
+        if (score <= 0.000001 &&
+            (strstr(name, "snd_aloop") || strstr(name, "loopback")))
+            score = -0.5;
+
+        if (!best || score > best_score) {
+            g_free(best);
+            best = g_strdup(name);
+            best_score = score;
+        }
+    }
+
+    g_ptr_array_free(sources, TRUE);
+    return best;
+}
+
+static gchar *configured_monitor_source(Visualizer *v) {
+    if (v->audio_device &&
+        g_strcmp0(v->audio_device, "automatic") != 0)
+        return g_strdup(v->audio_device);
+
+    return automatic_monitor_source();
+}
+
+
+
 
 static gboolean on_audio_data(GIOChannel *source, GIOCondition condition, gpointer data) {
     Visualizer *v = data;
@@ -191,8 +342,15 @@ static gboolean on_audio_data(GIOChannel *source, GIOCondition condition, gpoint
 }
 
 static gboolean start_capture(Visualizer *v) {
-    gchar *monitor = default_monitor_source();
-    if (!monitor) return FALSE;
+    gchar *monitor = configured_monitor_source(v);
+    if (!monitor)
+        return FALSE;
+
+    g_free(v->capture_device);
+    v->capture_device = g_strdup(monitor);
+
+    g_print("Capturing audio from: %s\n", monitor);
+
     gchar *device_arg = g_strdup_printf("--device=%s", monitor);
     gchar *rate_arg = g_strdup_printf("--rate=%d", SAMPLE_RATE);
     gchar *argv[] = {(gchar *)"parec", device_arg, (gchar *)"--raw", (gchar *)"--format=s16le",
@@ -212,6 +370,60 @@ static gboolean start_capture(Visualizer *v) {
     g_io_channel_set_flags(v->audio_channel, flags | G_IO_FLAG_NONBLOCK, NULL);
     v->audio_watch = g_io_add_watch(v->audio_channel,
         G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL, on_audio_data, v);
+    return TRUE;
+}
+
+static gboolean rescan_audio_device(gpointer data) {
+    Visualizer *v = data;
+
+    if (!v->audio_device ||
+        g_strcmp0(v->audio_device, "automatic") != 0)
+        return G_SOURCE_CONTINUE;
+
+    gchar *best = automatic_monitor_source();
+    if (!best)
+        return G_SOURCE_CONTINUE;
+
+    if (g_strcmp0(best, v->capture_device) != 0) {
+        g_print("Audio monitor changed: %s -> %s\n",
+                v->capture_device ? v->capture_device : "(none)",
+                best);
+
+        stop_capture_stream(v);
+
+        g_free(v->capture_device);
+        v->capture_device = NULL;
+
+        /*
+         * start_capture() performs a fresh automatic selection. This second
+         * selection is intentional; it avoids keeping a source that vanished
+         * between probe and restart.
+         */
+        start_capture(v);
+    }
+
+    g_free(best);
+    return G_SOURCE_CONTINUE;
+}
+
+
+static gboolean write_all(int fd, const gchar *data, gsize len) {
+    gsize offset = 0;
+
+    while (offset < len) {
+        ssize_t n = write(fd, data + offset, len - offset);
+
+        if (n > 0) {
+            offset += (gsize)n;
+            continue;
+        }
+
+        if (n < 0 && errno == EINTR)
+            continue;
+
+        return FALSE;
+    }
+
     return TRUE;
 }
 
@@ -236,7 +448,10 @@ static gboolean send_audio_level(gpointer data) {
         gchar *opts = g_strdup_printf("aw_audio=%s", value);
         gchar *json = g_strdup_printf(
             "{\"command\":[\"set_property\",\"glsl-shader-opts\",\"%s\"]}\n", opts);
-        write(fd, json, strlen(json));
+        if (!write_all(fd, json, strlen(json))) {
+            /* mpv may disappear between connect() and write(); simply retry
+             * on the next visualizer tick. */
+        }
         g_free(json); g_free(opts);
     }
     close(fd);
@@ -288,11 +503,27 @@ static void on_destroy(GtkWidget *widget, gpointer data) {
 int main(int argc, char **argv) {
     gtk_init(&argc,&argv);
     Visualizer v={0};
-    v.control_mode = argc > 1 && g_strcmp0(argv[1], "--control") == 0;
-    load_audio_config(&v);
-    v.ipc_path = audio_ipc_path();
+    gchar *ipc_override = NULL;
+    gboolean no_waveform = FALSE;
 
-    if (!v.control_mode) v.show_waveform = TRUE;
+    for (int i = 1; i < argc; i++) {
+        if (g_strcmp0(argv[i], "--control") == 0) {
+            v.control_mode = TRUE;
+        } else if (g_strcmp0(argv[i], "--no-waveform") == 0) {
+            no_waveform = TRUE;
+        } else if (g_strcmp0(argv[i], "--ipc-path") == 0 &&
+                   i + 1 < argc) {
+            ipc_override = g_strdup(argv[++i]);
+        }
+    }
+
+    load_audio_config(&v);
+    v.ipc_path = ipc_override ? ipc_override : audio_ipc_path();
+
+    if (no_waveform)
+        v.show_waveform = FALSE;
+    else if (!v.control_mode)
+        v.show_waveform = TRUE;
 
     if (v.show_waveform) {
         v.window=gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -323,7 +554,12 @@ int main(int argc, char **argv) {
     }
 
     if(!start_capture(&v)) return 1;
-    if(v.control_mode) v.control_timer=g_timeout_add(33,send_audio_level,&v);
+    if(v.control_mode)
+        v.control_timer=g_timeout_add(33,send_audio_level,&v);
+    if(v.audio_device &&
+       g_strcmp0(v.audio_device,"automatic")==0)
+        v.device_rescan_timer =
+            g_timeout_add_seconds(10,rescan_audio_device,&v);
     gtk_main();
     return 0;
 }

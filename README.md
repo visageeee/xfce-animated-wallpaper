@@ -229,3 +229,21 @@ Restart the settings app after adding or removing an effect. For graphics-driver
 ### Audio-reactive signal
 
 The Audio Visualizer can drive an effect parameter from either **Bass** or **Overall level**. Bass is the default and uses an inexpensive 40–180 Hz band-energy estimate with adaptive normalization, which generally gives more rhythmic movement than raw output level.
+
+### Presets
+
+The **Presets** tab saves, loads, and deletes effect and Audio Visualizer presets independently of the selected wallpaper. Presets are stored as INI files under:
+
+```text
+~/.config/xfce-animated-wallpaper/presets/
+```
+
+A preset records the active effect and its parameters, plus Audio Visualizer enablement, waveform overlay, audio source, controlled parameter, sensitivity, and smoothing. Loading a preset updates the settings UI and marks the configuration as changed; press **Set Wallpaper** to apply it.
+
+### Audio device selection
+
+The Audio Visualizer includes an **Audio device** selector. **Automatic (active output)** probes available PulseAudio/PipeWire monitor sources and follows the monitor carrying the strongest signal. A specific monitor source can be selected manually when preferred. Automatic mode rechecks periodically so changing output devices does not require restarting the settings application.
+
+### Full-screen showcase shortcut
+
+Press **Shift+F** in the settings window to show the currently selected wallpaper and active effect full-screen in the foreground. Any key press or mouse click exits the full-screen view. While showcase mode is active it pauses the desktop wallpaper and the settings preview, then resumes them when you exit. When Audio Visualizer control is enabled, audio-reactive parameters continue to respond in the full-screen showcase.
