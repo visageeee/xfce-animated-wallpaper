@@ -247,6 +247,34 @@ static gint effect_param_sort(gconstpointer a, gconstpointer b) {
     if (pa->order != pb->order) return pa->order - pb->order;
     return g_strcmp0(pa->name, pb->name);
 }
+/* Effect IDs become config group names and generated shader filenames.
+ * Keep them deliberately boring so a third-party effect cannot escape those
+ * namespaces with path separators or other metacharacters. */
+static gboolean effect_id_is_safe(const gchar *id) {
+    if (!id || !*id)
+        return FALSE;
+
+    for (const guchar *p = (const guchar *)id; *p; p++) {
+        if (!(g_ascii_isalnum(*p) || *p == '_' || *p == '-'))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+/* Manifest asset names must name a file inside the effect directory, not an
+ * absolute path or a path containing ../ (or subdirectories). */
+static gboolean effect_asset_name_is_safe(const gchar *name) {
+    if (!name || !*name)
+        return FALSE;
+
+    return g_path_is_absolute(name) == FALSE &&
+           strchr(name, '/') == NULL &&
+           strchr(name, '\\') == NULL &&
+           g_strcmp0(name, ".") != 0 &&
+           g_strcmp0(name, "..") != 0;
+}
+
 static gboolean effect_id_loaded(GPtrArray *effects, const gchar *id) {
     for (guint i=0; effects && i<effects->len; i++) {
         EffectDef *e = g_ptr_array_index(effects,i);
@@ -323,7 +351,10 @@ static void load_effect_dir(GPtrArray *effects,const gchar *base) {
         gchar *icon_name=g_key_file_has_key(kf,"Effect","icon",NULL)
                            ? g_key_file_get_string(kf,"Effect","icon",NULL)
                            : NULL;
-        if(!id||!*id||!name||!*name||!shader_name||!*shader_name||effect_id_loaded(effects,id)){
+        if(!effect_id_is_safe(id) || !name || !*name ||
+           !effect_asset_name_is_safe(shader_name) ||
+           (icon_name && *icon_name && !effect_asset_name_is_safe(icon_name)) ||
+           effect_id_loaded(effects,id)){
             g_free(id);g_free(name);g_free(desc);g_free(shader_name);g_free(icon_name);g_key_file_unref(kf);g_free(manifest);g_free(folder);continue;
         }
         gchar *shader=g_build_filename(folder,shader_name,NULL);
@@ -458,7 +489,7 @@ static void update_status(App *app) {
             (app->applied_source && g_strcmp0(app->applied_source, "stream") == 0)
                 ? "Web source"
                 : "Local file";
-        gchar *status = g_strdup_printf("Animated wallpaper is active — %s", kind);
+        gchar *status = g_strdup_printf("Animated wallpaper is active â€” %s", kind);
         gtk_label_set_text(GTK_LABEL(app->status_label), status);
         g_free(status);
     } else if (app->enabled) {
@@ -1126,7 +1157,7 @@ static void update_audio_control_indicators(App *app) {
 
     if (controlled_effect && controlled) {
         gchar *text = g_strdup_printf(
-            "🔊 Audio controlled:\n%s — %s",
+            "ðŸ”Š Audio controlled:\n%s â€” %s",
             controlled_effect->name,
             controlled->name);
         gtk_label_set_text(GTK_LABEL(app->preview_audio_label), text);
@@ -1718,7 +1749,7 @@ static void show_gallery(App *app) {
     gtk_label_set_xalign(GTK_LABEL(folder_label), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(folder_label), PANGO_ELLIPSIZE_MIDDLE);
     gtk_box_pack_start(GTK_BOX(top), folder_label, TRUE, TRUE, 0);
-    GtkWidget *change = gtk_button_new_with_label("Change Folder…");
+    GtkWidget *change = gtk_button_new_with_label("Change Folderâ€¦");
     gtk_box_pack_end(GTK_BOX(top), change, FALSE, FALSE, 0);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -2686,7 +2717,7 @@ static void on_save_preset_clicked(GtkButton *button, gpointer data) {
                         GTK_DIALOG_MODAL,
                         GTK_MESSAGE_QUESTION,
                         GTK_BUTTONS_NONE,
-                        "A preset named “%s” already exists.",
+                        "A preset named â€œ%sâ€ already exists.",
                         name);
                 gtk_message_dialog_format_secondary_text(
                     GTK_MESSAGE_DIALOG(confirm),
@@ -2763,7 +2794,7 @@ static void on_delete_preset_clicked(GtkButton *button, gpointer data) {
         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
         GTK_MESSAGE_WARNING,
         GTK_BUTTONS_NONE,
-        "Delete preset “%s”?",
+        "Delete preset â€œ%sâ€?",
         display_name);
 
     gtk_message_dialog_format_secondary_text(
@@ -3003,7 +3034,7 @@ static gchar *friendly_audio_device_name(const gchar *source) {
 
     if (strlen(name) > 30) {
         name[27] = '\0';
-        gchar *short_name = g_strconcat(name, "…", NULL);
+        gchar *short_name = g_strconcat(name, "â€¦", NULL);
         g_free(name);
         return short_name;
     }
@@ -3982,7 +4013,7 @@ int main(int argc, char **argv) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(app.audio_source_combo), 0);
     gtk_widget_set_size_request(app.audio_source_combo, 220, -1);
     gtk_box_pack_start(GTK_BOX(audio), row("Audio source",
-        "Bass follows roughly 40–180 Hz and usually gives stronger rhythmic variation than overall volume.",
+        "Bass follows roughly 40â€“180 Hz and usually gives stronger rhythmic variation than overall volume.",
         app.audio_source_combo), FALSE, FALSE, 0);
 
     app.audio_parameter_combo = gtk_combo_box_text_new();

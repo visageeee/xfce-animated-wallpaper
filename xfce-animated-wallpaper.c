@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 static void stop_audio_visualizer(void);
@@ -19,7 +21,19 @@ static gint backend_param_sort(gconstpointer a,gconstpointer b){const BackendPar
 static BackendParam*backend_activation_param(BackendEffect*e){if(!e||!e->params||!e->params->len)return NULL;for(guint i=0;i<e->params->len;i++){BackendParam*p=g_ptr_array_index(e->params,i);if(g_strcmp0(p->id,"strength")==0)return p;}return g_ptr_array_index(e->params,0);}
 static BackendEffect*backend_effect_by_id(GPtrArray*a,const gchar*id){if(!id||!*id)return NULL;for(guint i=0;a&&i<a->len;i++){BackendEffect*e=g_ptr_array_index(a,i);if(g_strcmp0(e->id,id)==0)return e;}return NULL;}
 static void backend_load_params(GKeyFile*k,BackendEffect*e){gsize n=0;gchar**g=g_key_file_get_groups(k,&n);for(gsize i=0;g&&i<n;i++){if(!g_str_has_prefix(g[i],"Parameter "))continue;const gchar*id=g[i]+strlen("Parameter ");if(!*id)continue;BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup(id);p->placeholder=g_key_file_has_key(k,g[i],"placeholder",NULL)?g_key_file_get_string(k,g[i],"placeholder",NULL):g_ascii_strup(id,-1);p->min=g_key_file_has_key(k,g[i],"min",NULL)?g_key_file_get_double(k,g[i],"min",NULL):0;p->max=g_key_file_has_key(k,g[i],"max",NULL)?g_key_file_get_double(k,g[i],"max",NULL):100;p->default_value=g_key_file_has_key(k,g[i],"default",NULL)?g_key_file_get_double(k,g[i],"default",NULL):p->min;p->order=g_key_file_has_key(k,g[i],"order",NULL)?g_key_file_get_integer(k,g[i],"order",NULL):1000;g_ptr_array_add(e->params,p);}g_strfreev(g);if(!e->params->len){BackendParam*p=g_new0(BackendParam,1);p->id=g_strdup("strength");p->placeholder=g_strdup("VALUE");p->min=g_key_file_has_key(k,"Effect","min",NULL)?g_key_file_get_double(k,"Effect","min",NULL):0;p->max=g_key_file_has_key(k,"Effect","max",NULL)?g_key_file_get_double(k,"Effect","max",NULL):100;p->default_value=g_key_file_has_key(k,"Effect","default",NULL)?g_key_file_get_double(k,"Effect","default",NULL):p->min;g_ptr_array_add(e->params,p);}g_ptr_array_sort(e->params,backend_param_sort);}
-static void backend_load_effect_dir(GPtrArray*a,const gchar*base){if(!base||!g_file_test(base,G_FILE_TEST_IS_DIR))return;GDir*d=g_dir_open(base,0,NULL);if(!d)return;const gchar*n;while((n=g_dir_read_name(d))){gchar*f=g_build_filename(base,n,NULL),*m=g_build_filename(f,"effect.ini",NULL);if(!g_file_test(m,G_FILE_TEST_IS_REGULAR)){g_free(m);g_free(f);continue;}GKeyFile*k=g_key_file_new();if(!g_key_file_load_from_file(k,m,G_KEY_FILE_NONE,NULL)){g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*id=g_key_file_get_string(k,"Effect","id",NULL),*sn=g_key_file_get_string(k,"Effect","shader",NULL);if(!id||!*id||!sn||!*sn||backend_effect_loaded(a,id)){g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*sp=g_build_filename(f,sn,NULL);if(!g_file_test(sp,G_FILE_TEST_IS_REGULAR)){g_free(sp);g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}BackendEffect*e=g_new0(BackendEffect,1);e->id=id;e->shader_path=sp;e->order=g_key_file_has_key(k,"Effect","order",NULL)?g_key_file_get_integer(k,"Effect","order",NULL):1000;e->params=g_ptr_array_new_with_free_func(backend_param_free);backend_load_params(k,e);g_ptr_array_add(a,e);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);}g_dir_close(d);}
+static gboolean backend_effect_id_is_safe(const gchar *id) {
+    if (!id || !*id)
+        return FALSE;
+
+    for (const guchar *p = (const guchar *)id; *p; p++) {
+        if (!(g_ascii_isalnum(*p) || *p == '_' || *p == '-'))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+static void backend_load_effect_dir(GPtrArray*a,const gchar*base){if(!base||!g_file_test(base,G_FILE_TEST_IS_DIR))return;GDir*d=g_dir_open(base,0,NULL);if(!d)return;const gchar*n;while((n=g_dir_read_name(d))){gchar*f=g_build_filename(base,n,NULL),*m=g_build_filename(f,"effect.ini",NULL);if(!g_file_test(m,G_FILE_TEST_IS_REGULAR)){g_free(m);g_free(f);continue;}GKeyFile*k=g_key_file_new();if(!g_key_file_load_from_file(k,m,G_KEY_FILE_NONE,NULL)){g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*id=g_key_file_get_string(k,"Effect","id",NULL),*sn=g_key_file_get_string(k,"Effect","shader",NULL);if(!backend_effect_id_is_safe(id)||!sn||!*sn||backend_effect_loaded(a,id)){g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}gchar*sp=g_build_filename(f,sn,NULL);if(!g_file_test(sp,G_FILE_TEST_IS_REGULAR)){g_free(sp);g_free(id);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);continue;}BackendEffect*e=g_new0(BackendEffect,1);e->id=id;e->shader_path=sp;e->order=g_key_file_has_key(k,"Effect","order",NULL)?g_key_file_get_integer(k,"Effect","order",NULL):1000;e->params=g_ptr_array_new_with_free_func(backend_param_free);backend_load_params(k,e);g_ptr_array_add(a,e);g_free(sn);g_key_file_unref(k);g_free(m);g_free(f);}g_dir_close(d);}
 static GPtrArray*backend_discover_effects(void){GPtrArray*a=g_ptr_array_new_with_free_func(backend_effect_free);gchar*u=g_build_filename(g_get_user_data_dir(),"xfce-animated-wallpaper","effects",NULL);backend_load_effect_dir(a,u);g_free(u);backend_load_effect_dir(a,"./effects");backend_load_effect_dir(a,"/usr/local/share/xfce-animated-wallpaper/effects");backend_load_effect_dir(a,"/usr/share/xfce-animated-wallpaper/effects");g_ptr_array_sort(a,backend_effect_sort);return a;}
 
 
@@ -140,14 +154,52 @@ static gchar *config_path(void) {
     return g_build_filename(g_get_user_config_dir(), "xfce-animated-wallpaper", "config.ini", NULL);
 }
 
+static gchar *runtime_base_dir(void) {
+    const gchar *runtime = g_get_user_runtime_dir();
+
+    if (runtime && *runtime)
+        return g_strdup(runtime);
+
+    gchar *dir = g_strdup_printf(
+        "/tmp/xfce-animated-wallpaper-%lu",
+        (unsigned long)getuid());
+
+    GStatBuf st;
+    if (g_lstat(dir, &st) == 0) {
+        if (!S_ISDIR(st.st_mode) || st.st_uid != getuid()) {
+            g_printerr(
+                "Unsafe runtime path exists and is not owned by this user: %s\n",
+                dir);
+            g_free(dir);
+            dir = g_build_filename(
+                g_get_user_cache_dir(),
+                "xfce-animated-wallpaper",
+                "runtime",
+                NULL);
+        }
+    }
+
+    if (g_mkdir_with_parents(dir, 0700) != 0) {
+        g_printerr("Could not create runtime directory: %s\n", dir);
+    } else {
+        g_chmod(dir, 0700);
+    }
+
+    return dir;
+}
+
 static gchar *pid_path(void) {
-    return g_build_filename(g_get_user_runtime_dir() ? g_get_user_runtime_dir() : "/tmp",
-                            "xfce-animated-wallpaper.pid", NULL);
+    gchar *runtime = runtime_base_dir();
+    gchar *path = g_build_filename(runtime, "xfce-animated-wallpaper.pid", NULL);
+    g_free(runtime);
+    return path;
 }
 
 static gchar *icons_pid_path(void) {
-    return g_build_filename(g_get_user_runtime_dir() ? g_get_user_runtime_dir() : "/tmp",
-                            "xfce-animated-wallpaper-icons.pid", NULL);
+    gchar *runtime = runtime_base_dir();
+    gchar *path = g_build_filename(runtime, "xfce-animated-wallpaper-icons.pid", NULL);
+    g_free(runtime);
+    return path;
 }
 
 static GPid read_icons_pid(void) {
@@ -479,13 +531,17 @@ static void add_backend_effect_shader(GPtrArray *a, GKeyFile *k, BackendEffect *
 }
 
 static gchar *audio_ipc_path(void) {
-    const gchar *runtime = g_get_user_runtime_dir();
-    return g_build_filename(runtime ? runtime : "/tmp", "xfce-animated-wallpaper-mpv.sock", NULL);
+    gchar *runtime = runtime_base_dir();
+    gchar *path = g_build_filename(runtime, "xfce-animated-wallpaper-mpv.sock", NULL);
+    g_free(runtime);
+    return path;
 }
 
 static gchar *visualizer_pid_path(void) {
-    const gchar *runtime = g_get_user_runtime_dir();
-    return g_build_filename(runtime ? runtime : "/tmp", "xfce-animated-wallpaper-visualizer.pid", NULL);
+    gchar *runtime = runtime_base_dir();
+    gchar *path = g_build_filename(runtime, "xfce-animated-wallpaper-visualizer.pid", NULL);
+    g_free(runtime);
+    return path;
 }
 
 static GPid read_visualizer_pid(void) {
@@ -907,3 +963,4 @@ int main(int argc, char **argv) {
     g_printerr("Unknown command: %s\n", argv[1]);
     return 2;
 }
+
