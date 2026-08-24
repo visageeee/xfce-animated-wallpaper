@@ -9,26 +9,18 @@ It includes real-time GPU shader effects with a plugin system, presets, and an a
 
 ![Demo](demo.webp)
 
+
 ## Features
 
-- Native GTK3 settings app integrated with Xfce Settings Manager
-- Optional lightweight desktop icon layer showing items from the XDG Desktop folder above the wallpaper
-- GPU shader effects with adjustable effect-specific parameters
-- Audio-reactive effect control with bass or overall-level detection
-- Save, load and delete effect/audio presets
-- Full-screen wallpaper showcase mode (`Shift+F`)
-- Video, GIF, APNG and static image wallpaper support
-- Web URL sources, including direct network streams and experimental web-video support through `yt-dlp`
-- Clickable wallpaper preview
-- Thumbnail gallery for visually choosing wallpapers
-- **Set Wallpaper** applies changes explicitly; editing settings does not restart the wallpaper
-- **Turn Off** returns to the normal Xfce desktop background
-- Fill, Fit and Stretch scaling modes
-- Playback speed control in 0.1Ã— increments
-- Loop wallpaper video
-- Optional start on login
-- Safe Xfce autostart that waits for the desktop before launching
-- Running-state indicator
+- Animated video and image wallpapers
+- Real-time GPU shader effects with a plugin system
+- Audio-reactive effects and visualizer
+- Effect and audio presets
+- Live wallpaper preview
+- Desktop icon support
+- Fullscreen showcase mode
+- Playback and image adjustments
+- Pause on fullscreen applications or battery power
 
 ### Effects
 
