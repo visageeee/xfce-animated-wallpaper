@@ -2,7 +2,7 @@
 
 **Xfce Animated Wallpaper** is a small X11 utility for running animated wallpapers on Xfce using `xwinwrap` and `mpv`.
 
-It includes real-time GPU shader effects with a plugin system, presets, and an audio visualizer that can make effects react dynamically to your music - from subtle bass-driven distortions to a full-on audio-synchronized visual spectacle.
+It includes real-time GPU shader effects with a plugin system, presets, and an audio visualizer that can make effects react dynamically to your audio output - from subtle bass-driven distortions to a full-on music-synchronized visual spectacle.
 
 > **Version:** 0.3.0  
 > **Status:** early release. X11 only.
