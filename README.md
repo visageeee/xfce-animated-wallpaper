@@ -52,6 +52,8 @@ Static images can also use animated effects. PNG, JPEG, WebP, BMP and TIFF sourc
 
 Fullscreen and battery pausing suspend the `mpv` process and resume it in place, so playback continues from the same point without rebuilding the wallpaper window.
 
+![Demo](demo.webp)
+
 ## Installation
 
 The project is intended for **Xfce running under X11**.
@@ -114,7 +116,7 @@ If **Start when you log in** is enabled, the wallpaper is restored on login only
 
 ## Audio Visualizer
 
-The **Audio Visualizer** can drive a parameter of the active effect from either **Bass** or **Overall level**. Bass is the default and uses a lightweight 40â€“180 Hz band-energy estimate with adaptive normalization, which generally gives more rhythmic movement than raw output level.
+The **Audio Visualizer** can drive a parameter of the active effect from either **Bass** or **Overall level**. Bass is the default and uses a lightweight 40-180 Hz band-energy estimate with adaptive normalization, which generally gives more rhythmic movement than raw output level.
 
 The **Audio device** selector can use **Automatic (active output)** to probe available PulseAudio/PipeWire monitor sources and follow the monitor carrying the strongest signal, or a specific monitor source can be selected manually. Automatic mode periodically rechecks the available outputs.
 
@@ -136,9 +138,9 @@ Press **Shift+F** in the settings window to show the currently selected wallpape
 
 Keyboard shortcuts:
 
-- `1`â€“`4` â€” switch between the first four settings tabs
-- `Enter` â€” set wallpaper
-- `Shift+F` â€” full-screen showcase
+- `1`-`4` - switch between the first four settings tabs
+- `Enter` - set wallpaper
+- `Shift+F` - full-screen showcase
 
 ## Desktop icons
 
