@@ -11,6 +11,10 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 
 - Native GTK3 settings app integrated with Xfce Settings Manager
 - Optional lightweight desktop icon layer showing items from the XDG Desktop folder above the wallpaper
+- GPU shader effects with adjustable effect-specific parameters
+- Audio-reactive effect control with bass or overall-level detection
+- Save, load and delete effect/audio presets
+- Full-screen wallpaper showcase mode (`Shift+F`)
 - Video, GIF, APNG and static image wallpaper support
 - Web URL sources, including direct network streams and experimental web-video support through `yt-dlp`
 - Clickable wallpaper preview
@@ -18,7 +22,7 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 - **Set Wallpaper** applies changes explicitly; editing settings does not restart the wallpaper
 - **Turn Off** returns to the normal Xfce desktop background
 - Fill, Fit and Stretch scaling modes
-- Playback speed control in 0.1× increments
+- Playback speed control in 0.1Ã— increments
 - Loop wallpaper video
 - Optional start on login
 - Safe Xfce autostart that waits for the desktop before launching
@@ -28,7 +32,7 @@ The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desk
 
 The **Effects** tab applies GPU shaders through mpv's renderer. Effects are modular and discovered at runtime, are listed alphabetically, can provide optional module icons, and can expose their own adjustable parameters such as strength, speed, scale or intensity.
 
-Built-in effects include blur, vignette, film grain, chromatic aberration, scanlines, wave distortion, dream diffusion, bloom and ripple-style animated effects.
+Built-in effects include blur, vignette, chromatic aberration, scanlines, wave and water-ripple distortion, dream diffusion, drifting clouds, god rays, Matrix rain, kaleidoscope, stars, rain-on-glass, bioluminescent and sun effects.
 
 For graphics-driver stability, only one GPU effect can be active at a time. Enabling one effect automatically disables the others.
 
@@ -48,21 +52,39 @@ Static images can also use animated effects. PNG, JPEG, WebP, BMP and TIFF sourc
 
 Fullscreen and battery pausing suspend the `mpv` process and resume it in place, so playback continues from the same point without rebuilding the wallpaper window.
 
-## Requirements
+## Installation
 
 The project is intended for **Xfce running under X11**.
 
-Ubuntu / Xubuntu / Debian build and runtime dependencies:
+### Debian / Ubuntu package
+
+The easiest installation method is the prebuilt `.deb` from the GitHub release.
+
+```bash
+sudo apt install ./xfce-animated-wallpaper_0.3.0_amd64.deb
+```
+
+The package includes its own private copy of `xwinwrap`, so it does not need to be installed separately.
+
+Then open:
+
+**Xfce Settings Manager â†’ Animated Wallpaper**
+
+or run:
+
+```bash
+xfce-animated-wallpaper-settings
+```
+
+### Build from source
+
+Install the build and runtime dependencies:
 
 ```bash
 sudo apt install build-essential libgtk-3-dev libglib2.0-dev mpv ffmpeg x11-utils pulseaudio-utils
 ```
 
-You also need `xwinwrap` installed and available in your `PATH`.
-
-`ffmpeg` is used to generate preview/gallery thumbnails and the cached 30 FPS videos used for animated static-image wallpapers. `xprop` from `x11-utils` is used for fullscreen detection.
-
-## Build and install
+A source installation also requires `xwinwrap` to be installed and available in your `PATH`.
 
 ```bash
 git clone <repository-url>
@@ -71,17 +93,9 @@ make
 sudo make install
 ```
 
-Then open:
+`ffmpeg` is used to generate preview/gallery thumbnails and the cached 30 FPS videos used for animated static-image wallpapers. `xprop` from `x11-utils` is used for fullscreen detection.
 
-**Xfce Settings Manager → Animated Wallpaper**
-
-or run:
-
-```bash
-xfce-animated-wallpaper-settings
-```
-
-To uninstall:
+To uninstall a source installation:
 
 ```bash
 sudo make uninstall
@@ -98,9 +112,37 @@ Press **Turn Off** to stop the animated wallpaper and return to the desktop back
 If **Start when you log in** is enabled, the wallpaper is restored on login only if it was left active. Turning it off keeps it off at the next login.
 
 
+## Audio Visualizer
+
+The **Audio Visualizer** can drive a parameter of the active effect from either **Bass** or **Overall level**. Bass is the default and uses a lightweight 40â€“180 Hz band-energy estimate with adaptive normalization, which generally gives more rhythmic movement than raw output level.
+
+The **Audio device** selector can use **Automatic (active output)** to probe available PulseAudio/PipeWire monitor sources and follow the monitor carrying the strongest signal, or a specific monitor source can be selected manually. Automatic mode periodically rechecks the available outputs.
+
+## Presets
+
+The **Presets** tab saves, loads and deletes effect and Audio Visualizer presets independently of the selected wallpaper.
+
+Presets are stored under:
+
+```text
+~/.config/xfce-animated-wallpaper/presets/
+```
+
+A preset records the active effect and its parameters plus Audio Visualizer settings. Loading a preset updates the settings UI; press **Set Wallpaper** to apply it.
+
+## Full-screen showcase and shortcuts
+
+Press **Shift+F** in the settings window to show the currently selected wallpaper and active effect full-screen in the foreground. Any key press or mouse click exits. While showcase mode is active, the desktop wallpaper and settings preview are paused and resume when you exit. Audio-reactive parameters continue to respond in showcase mode.
+
+Keyboard shortcuts:
+
+- `1`â€“`4` â€” switch between the first four settings tabs
+- `Enter` â€” set wallpaper
+- `Shift+F` â€” full-screen showcase
+
 ## Desktop icons
 
-Animated wallpapers created with `xwinwrap` can cover Xfce's normal desktop icons. The optional **Show desktop icons above wallpaper** setting starts a lightweight companion process, `xfce-animated-wallpaper-icons`, which displays items from the user's XDG Desktop directory above the wallpaper while remaining below normal application windows.
+Animated wallpapers created with `xwinwrap` can cover Xfce's normal desktop icons. The optional **Show desktop icons** setting starts a lightweight companion process, `xfce-animated-wallpaper-icons`, which displays items from the user's XDG Desktop directory above the wallpaper while remaining below normal application windows.
 
 The icon layer uses the system icon theme, opens files and folders with their normal applications, launches `.desktop` files, watches the Desktop folder for changes, and stops automatically when the animated wallpaper is turned off.
 
@@ -177,15 +219,11 @@ Effects are discovered at runtime. Each effect is a folder containing:
 
 ```text
 my-effect/
-├── effect.ini
-└── shader.glsl
+â”œâ”€â”€ effect.ini
+â””â”€â”€ shader.glsl
 ```
 
-System effects are installed under:
-
-```text
-/usr/local/share/xfce-animated-wallpaper/effects/
-```
+System effects are installed under `/usr/share/xfce-animated-wallpaper/effects/` by the Debian package, or `/usr/local/share/xfce-animated-wallpaper/effects/` by the default source installation.
 
 User effects can be installed without root under:
 
@@ -226,35 +264,14 @@ vec4 hook() {
 
 Restart the settings app after adding or removing an effect. For graphics-driver stability, only one effect can be active at a time.
 
-### Audio-reactive signal
+## Building a Debian package
 
-The Audio Visualizer can drive an effect parameter from either **Bass** or **Overall level**. Bass is the default and uses an inexpensive 40–180 Hz band-energy estimate with adaptive normalization, which generally gives more rhythmic movement than raw output level.
+Maintainers can build an amd64 `.deb` with:
 
-### Presets
-
-The **Presets** tab saves, loads, and deletes effect and Audio Visualizer presets independently of the selected wallpaper. Presets are stored as INI files under:
-
-```text
-~/.config/xfce-animated-wallpaper/presets/
+```bash
+make deb
 ```
 
-A preset records the active effect and its parameters, plus Audio Visualizer enablement, waveform overlay, audio source, controlled parameter, sensitivity, and smoothing. Loading a preset updates the settings UI and marks the configuration as changed; press **Set Wallpaper** to apply it.
-
-### Audio device selection
-
-The Audio Visualizer includes an **Audio device** selector. **Automatic (active output)** probes available PulseAudio/PipeWire monitor sources and follows the monitor carrying the strongest signal. A specific monitor source can be selected manually when preferred. Automatic mode rechecks periodically so changing output devices does not require restarting the settings application.
-
-### Full-screen showcase shortcut
-
-Press **Shift+F** in the settings window to show the currently selected wallpaper and active effect full-screen in the foreground. Any key press or mouse click exits the full-screen view. While showcase mode is active it pauses the desktop wallpaper and the settings preview, then resumes them when you exit. When Audio Visualizer control is enabled, audio-reactive parameters continue to respond in the full-screen showcase.
+The build machine must have a working `xwinwrap` executable in `PATH`. It is bundled privately into the resulting package under `/usr/lib/xfce-animated-wallpaper/`, together with its redistribution notice.
 
 
-### Debian package
-
-`make deb` builds an amd64 Debian package and bundles the build machine's
-`xwinwrap` binary privately under `/usr/lib/xfce-animated-wallpaper/`.
-This makes the resulting `.deb` self-contained with respect to xwinwrap.
-The xwinwrap license notice is installed under
-`/usr/share/doc/xfce-animated-wallpaper/`.
-
-The build machine must already have a working `xwinwrap` executable in `PATH`.
