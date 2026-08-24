@@ -63,7 +63,7 @@ The package includes its own private copy of `xwinwrap`, so it does not need to 
 
 Then open:
 
-**Xfce Settings Manager â†’ Animated Wallpaper**
+**Xfce Settings Manager - Animated Wallpaper**
 
 or run:
 
