@@ -1,8 +1,8 @@
 # Xfce Animated Wallpaper
 
-A lightweight GTK3 settings app for using videos, animated media, web sources and static images as desktop backgrounds on **Xfce/X11**, powered by `xwinwrap` and `mpv`.
+**Xfce Animated Wallpaper** is a small X11 utility for running animated wallpapers on Xfce using `xwinwrap` and `mpv`.
 
-The app integrates with **Xfce Settings Manager** and keeps the normal Xfce desktop background underneath the animated layer, so turning it off immediately restores your regular desktop background.
+It includes real-time GPU shader effects with a plugin system, presets, and an audio visualizer that can make effects react dynamically to your music - from subtle bass-driven distortions to a full-on audio-synchronized visual spectacle.
 
 > **Version:** 0.3.0  
 > **Status:** early release. X11 only.
