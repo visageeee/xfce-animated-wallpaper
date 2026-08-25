@@ -489,7 +489,7 @@ static void update_status(App *app) {
             (app->applied_source && g_strcmp0(app->applied_source, "stream") == 0)
                 ? "Web source"
                 : "Local file";
-        gchar *status = g_strdup_printf("Animated wallpaper is active â€” %s", kind);
+        gchar *status = g_strdup_printf("Animated wallpaper is active - %s", kind);
         gtk_label_set_text(GTK_LABEL(app->status_label), status);
         g_free(status);
     } else if (app->enabled) {
@@ -1157,7 +1157,7 @@ static void update_audio_control_indicators(App *app) {
 
     if (controlled_effect && controlled) {
         gchar *text = g_strdup_printf(
-            "ðŸ”Š Audio controlled:\n%s â€” %s",
+            "Audio controlled:\n%s - %s",
             controlled_effect->name,
             controlled->name);
         gtk_label_set_text(GTK_LABEL(app->preview_audio_label), text);
