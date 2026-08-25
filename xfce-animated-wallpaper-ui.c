@@ -1157,7 +1157,7 @@ static void update_audio_control_indicators(App *app) {
 
     if (controlled_effect && controlled) {
         gchar *text = g_strdup_printf(
-            "Audio controlled:\n%s - %s",
+            "\xF0\x9F\x94\x8A Audio controlled:\n%s - %s",
             controlled_effect->name,
             controlled->name);
         gtk_label_set_text(GTK_LABEL(app->preview_audio_label), text);
